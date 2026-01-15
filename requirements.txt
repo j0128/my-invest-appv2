@@ -6,3 +6,4 @@ fredapi
 plotly
 scikit-learn
 requests
+xgboost
