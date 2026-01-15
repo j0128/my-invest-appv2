@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 10.0: 宗師全配版", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Alpha 11.0: 戰略指揮中心", layout="wide", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -81,7 +81,16 @@ def get_advanced_info(ticker):
         }
     except: return {}
 
-# --- 2. 戰略運算 (AI & Targets) ---
+# --- 2. 戰略運算 (AI & Targets & MVRV) ---
+
+def calc_mvrv_z(series):
+    """MVRV Z-Score: (Price - 200SMA) / StdDev"""
+    if len(series) < 200: return None
+    sma200 = series.rolling(200).mean()
+    std200 = series.rolling(200).std()
+    z_score = (series - sma200) / std200
+    return z_score
+
 def train_ai_model(target_ticker, df_close, df_vol, days_forecast=22):
     try:
         if target_ticker not in df_close.columns: return None
@@ -106,26 +115,26 @@ def calc_targets_composite(ticker, df_close, df_high, df_low, df_vol, f_data, da
     c = df_close[ticker]; h = df_high[ticker]; l = df_low[ticker]
     if len(c) < 100: return None
     
-    # 1. ATR (物理)
+    # ATR
     try:
         tr = pd.concat([h-l, (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
         atr = tr.rolling(14).mean().iloc[-1]
         t_atr = c.iloc[-1] + (atr * np.sqrt(days_forecast))
     except: t_atr = None
     
-    # 2. MC (機率)
+    # MC
     try:
         mu = c.pct_change().mean()
         t_mc = c.iloc[-1] * ((1 + mu)**days_forecast)
     except: t_mc = None
     
-    # 3. Fib (心理)
+    # Fib
     try:
         recent = c.iloc[-60:]
         t_fib = recent.max() + (recent.max() - recent.min()) * 0.618 
     except: t_fib = None
     
-    # 4. Fund & AI
+    # Fund & AI
     t_fund = f_data.get('Target_Mean')
     t_ai = train_ai_model(ticker, df_close, df_vol, days_forecast)
     
@@ -145,7 +154,7 @@ def run_backtest_lab(ticker, df_close, df_high, df_low, days_ago=22):
     h_slice = df_high[ticker].iloc[:idx_past+1]
     l_slice = df_low[ticker].iloc[:idx_past+1]
     
-    # 重算 ATR (代表技術面)
+    # 重算 ATR
     tr = pd.concat([h_slice-l_slice], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().iloc[-1]
     past_atr = c_slice.iloc[-1] + (atr * np.sqrt(days_ago))
@@ -153,7 +162,6 @@ def run_backtest_lab(ticker, df_close, df_high, df_low, days_ago=22):
     # 重算 MC
     past_mc = c_slice.iloc[-1] * ((1 + c_slice.pct_change().mean())**days_ago)
     
-    # 平均
     past_avg = (past_atr + past_mc) / 2
     err = (past_avg - p_now) / p_now
     
@@ -165,38 +173,39 @@ def analyze_trend_multi(series):
     x = np.arange(len(y)).reshape(-1, 1)
     model = LinearRegression().fit(x, y)
     
+    p_now = series.iloc[-1]
+    sma200 = series.rolling(200).mean().iloc[-1]
+    status = "🔥 多頭" if p_now > sma200 else "🛑 空頭"
+    if p_now < sma200 and p_now > sma200 * 0.9: status = "📉 弱勢"
+    
     return {
         "p_2w": model.predict([[len(y)+10]])[0].item(),
         "p_1m": model.predict([[len(y)+22]])[0].item(),
         "p_3m": model.predict([[len(y)+66]])[0].item(),
-        "p_now": series.iloc[-1],
-        "sma200": series.rolling(200).mean().iloc[-1]
+        "p_now": p_now,
+        "sma200": sma200,
+        "status": status
     }
+
+def calc_kelly(trend_status, win_rate=0.55):
+    if "多頭" in trend_status: win_rate += 0.1
+    if "空頭" in trend_status: win_rate -= 0.15
+    f_star = (win_rate * 2.0 - 1) / 1.0 
+    return max(0, f_star * 0.5)
 
 def calc_obv(close, volume):
     if volume is None: return None
     return (np.sign(close.diff()) * volume).fillna(0).cumsum()
 
-# --- 3. 策略與財務模組 ---
+# --- 3. 財務計算引擎 ---
 def run_traffic_light_strategy(series):
-    """紅綠燈策略回測 (Traffic Light Backtest)"""
-    if len(series) < 200: return None
-    
+    if len(series) < 200: return None, None
     sma200 = series.rolling(200).mean()
-    sma50 = series.rolling(50).mean()
-    
-    df = pd.DataFrame({'Close': series, 'SMA200': sma200, 'SMA50': sma50})
-    df['Signal'] = 0
-    # 綠燈: 價格 > 200MA (持有)
-    df.loc[df['Close'] > df['SMA200'], 'Signal'] = 1
-    
-    df['Strategy_Ret'] = df['Close'].pct_change() * df['Signal'].shift(1)
-    df['BuyHold_Ret'] = df['Close'].pct_change()
-    
-    cum_strat = (1 + df['Strategy_Ret']).cumprod()
-    cum_bh = (1 + df['BuyHold_Ret']).cumprod()
-    
-    return cum_strat, cum_bh
+    df = pd.DataFrame({'Close': series, 'SMA200': sma200})
+    df['Signal'] = np.where(df['Close'] > df['SMA200'], 1, 0)
+    df['Strategy'] = (1 + df['Close'].pct_change() * df['Signal'].shift(1)).cumprod()
+    df['BuyHold'] = (1 + df['Close'].pct_change()).cumprod()
+    return df['Strategy'], df['BuyHold']
 
 def calc_coast_fire(current_age, retire_age, current_net_worth, monthly_saving, return_rate, inflation):
     years = retire_age - current_age
@@ -212,7 +221,7 @@ def calc_mortgage(amount, years, rate_pct):
     rate = rate_pct / 100 / 12
     months = years * 12
     pmt = amount * (rate * (1 + rate)**months) / ((1 + rate)**months - 1)
-    return pmt
+    return pmt, pmt * months - amount
 
 def parse_input(text):
     port = {}
@@ -235,11 +244,11 @@ def main():
         total_value = sum(portfolio_dict.values())
         st.metric("總資產 (Est.)", f"${total_value:,.0f}")
         
-        if st.button("🚀 啟動宗師版", type="primary"): st.session_state['run'] = True
+        if st.button("🚀 啟動指揮中心", type="primary"): st.session_state['run'] = True
 
     if not st.session_state.get('run', False): return
 
-    with st.spinner("🦅 正在執行 Alpha 10.0 全系統運算..."):
+    with st.spinner("🦅 Alpha 11.0 正在掃描全域..."):
         df_close, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_macro = fetch_fred_macro(fred_key)
         adv_data = {t: get_advanced_info(t) for t in tickers_list}
@@ -254,9 +263,9 @@ def main():
 
     # === TAB 1: 戰略戰情室 (Strategy) ===
     with t1:
-        st.subheader("1. 宏觀與預測 (Macro & Forecast)")
+        st.subheader("1. 宏觀與持倉總覽")
         
-        # Macro
+        # 宏觀儀表
         vix = df_close['^VIX'].iloc[-1] if '^VIX' in df_close.columns else 0
         tnx = df_close['^TNX'].iloc[-1] if '^TNX' in df_close.columns else 0
         liq = df_macro['Net_Liquidity'].iloc[-1] if df_macro is not None else 0
@@ -268,10 +277,42 @@ def main():
         c2.metric("🌪️ VIX", f"{vix:.2f}", delta_color="inverse")
         c3.metric("⚖️ 10年殖利率", f"{tnx:.2f}%")
         c4.metric("🏭 銅金比", f"{cg:.2f}")
+
+        # [NEW] 流動性圖表
+        if df_macro is not None:
+            fig_liq = px.line(df_macro, y='Net_Liquidity', title='聯準會淨流動性趨勢 (Net Liquidity)', color_discrete_sequence=['#00BFFF'])
+            fig_liq.update_layout(height=250, margin=dict(l=0,r=0,t=30,b=0))
+            st.plotly_chart(fig_liq, use_container_width=True)
         
-        st.divider()
+        st.markdown("---")
         
-        # Individual
+        # [NEW] 持倉戰略總表 (Portfolio Command)
+        st.markdown("#### 📊 持倉戰略總表")
+        summary_data = []
+        
+        for ticker in tickers_list:
+            if ticker not in df_close.columns: continue
+            
+            # 計算數據
+            trend = analyze_trend_multi(df_close[ticker])
+            mvrv_s = calc_mvrv_z(df_close[ticker])
+            mvrv = mvrv_s.iloc[-1] if mvrv_s is not None else 0
+            kelly = calc_kelly(trend['status'])
+            
+            summary_data.append({
+                "代號": ticker,
+                "現價": f"${trend['p_now']:.2f}",
+                "趨勢狀態": trend['status'],
+                "MVRV 位階": f"{mvrv:.2f} (Z)",
+                "Kelly 建議": f"{kelly*100:.1f}%",
+                "1月預測": f"${trend.get('p_1m', 0):.2f}"
+            })
+        st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
+        
+        st.markdown("---")
+        
+        # 個股詳細分析 (Deep Dive)
+        st.subheader("2. 個股戰略雷達 (Strategic Radar)")
         for ticker in tickers_list:
             if ticker not in df_close.columns: continue
             
@@ -280,13 +321,15 @@ def main():
             targets = calc_targets_composite(ticker, df_close, df_high, df_low, df_vol, info, 22)
             bt = run_backtest_lab(ticker, df_close, df_high, df_low, 22)
             obv = calc_obv(df_close[ticker], df_vol[ticker])
+            mvrv_s = calc_mvrv_z(df_close[ticker])
+            mvrv = mvrv_s.iloc[-1] if mvrv_s is not None else 0
             
             t_avg = f"${targets['Avg']:.2f}" if targets and targets['Avg'] else "-"
             
-            with st.expander(f"🦅 {ticker} | 綜合目標: {t_avg}", expanded=True):
+            with st.expander(f"🦅 {ticker} | MVRV: {mvrv:.2f} | 目標: {t_avg}", expanded=False):
                 k1, k2, k3 = st.columns([2, 1, 1])
                 with k1:
-                    st.markdown("#### 📉 價格與 OBV 資金流")
+                    st.markdown("#### 📉 價格與資金流")
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(x=df_close.index[-126:], y=df_close[ticker].iloc[-126:], name='Price', line=dict(color='#00FF7F')))
                     if obv is not None:
@@ -303,15 +346,18 @@ def main():
                         st.write(f"**Fund:** ${targets['Fund']}" if targets['Fund'] else "N/A")
                     
                     if bt:
-                        st.markdown("#### 🧪 回測實驗室")
+                        st.markdown("#### 🧪 回測")
                         err = bt['Error']
                         c = "green" if abs(err)<0.05 else "red"
-                        st.markdown(f"1月前誤差: <span style='color:{c}'>{err:.1%}</span>", unsafe_allow_html=True)
+                        st.markdown(f"誤差: <span style='color:{c}'>{err:.1%}</span>", unsafe_allow_html=True)
                 with k3:
-                    st.markdown("#### 🔮 未來矩陣")
-                    st.metric("2週", f"${trend.get('p_2w',0):.2f}")
-                    st.metric("1月", f"${trend.get('p_1m',0):.2f}")
-                    st.metric("3月", f"${trend.get('p_3m',0):.2f}")
+                    st.markdown("#### 💎 戰略指標")
+                    z_col = "red" if mvrv > 2 else ("green" if mvrv < 0 else "white")
+                    st.metric("MVRV Z-Score", f"{mvrv:.2f}", delta_color="off")
+                    st.caption(" > 2 過熱 | < 0 超賣")
+                    
+                    st.metric("1月預測", f"${trend['p_1m']:.2f}")
+                    st.metric("Rule 40", f"{info.get('Rule_40', 0):.1f}" if info.get('Rule_40') else "-")
 
     # === TAB 2: 深度籌碼 (Chips) ===
     with t2:
@@ -319,17 +365,13 @@ def main():
         chip_data = []
         for t in tickers_list:
             info = adv_data.get(t, {})
-            inst = info.get('Inst_Held', 0)
-            insider = info.get('Insider_Held', 0)
-            short = info.get('Short_Ratio', 0)
             chip_data.append({
                 "代號": t,
-                "機構持股": f"{inst*100:.1f}%" if inst else "-",
-                "內部人持股": f"{insider*100:.1f}%" if insider else "-",
-                "空單比例": short
+                "機構持股": f"{info.get('Inst_Held', 0)*100:.1f}%" if info.get('Inst_Held') else "-",
+                "內部人持股": f"{info.get('Insider_Held', 0)*100:.1f}%" if info.get('Insider_Held') else "-",
+                "空單比例": info.get('Short_Ratio', 0)
             })
         st.dataframe(pd.DataFrame(chip_data), use_container_width=True)
-        st.info("💡 邏輯：機構 > 70% 代表籌碼穩定；內部人高代表公司派有信心；空單高代表有軋空機會。")
 
     # === TAB 3: 個股體檢 (Health) ===
     with t3:
@@ -337,11 +379,8 @@ def main():
         health_data = []
         for t in tickers_list:
             info = adv_data.get(t, {})
-            r40 = (info.get('Rev_Growth', 0) + info.get('Profit_Margin', 0)) * 100 if info.get('Rev_Growth') else 0
-            
             health_data.append({
                 "代號": t,
-                "Rule 40 (SaaS)": f"{r40:.1f}",
                 "流動比 (>1.5)": info.get('Current_Ratio'),
                 "負債/權益 (<1)": info.get('Debt_Equity'),
                 "ROE": f"{info.get('ROE', 0)*100:.1f}%" if info.get('ROE') else "-",
@@ -351,80 +390,40 @@ def main():
 
     # === TAB 4: 策略回測 (Backtest) ===
     with t4:
-        st.subheader("🚦 紅綠燈趨勢策略回測 (Traffic Light)")
-        st.caption("策略邏輯：價格 > 200日均線時買進持有；跌破時清倉轉現金。")
-        
+        st.subheader("🚦 紅綠燈策略回測")
         for t in tickers_list:
             if t not in df_close.columns: continue
             strat, bh = run_traffic_light_strategy(df_close[t])
-            
             if strat is not None:
-                ret_strat = strat.iloc[-1] - 1
-                ret_bh = bh.iloc[-1] - 1
-                
-                c1, c2 = st.columns(2)
-                c1.metric(f"{t} 策略報酬", f"{ret_strat:.1%}", delta=f"勝過買持 {ret_strat-ret_bh:.1%}")
-                
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=strat.index, y=strat, name='策略 (Trend)', line=dict(color='#00FF7F')))
-                fig.add_trace(go.Scatter(x=bh.index, y=bh, name='買進持有 (Buy&Hold)', line=dict(color='gray', dash='dash')))
-                fig.update_layout(title=f"{t} 累計報酬率比較", height=300)
+                fig.add_trace(go.Scatter(x=bh.index, y=bh, name='買進持有', line=dict(color='gray', dash='dash')))
+                fig.update_layout(title=f"{t} 累計報酬", height=300)
                 st.plotly_chart(fig, use_container_width=True)
 
     # === TAB 5: CFO 財報 (Personal) ===
     with t5:
         st.subheader("💰 個人 CFO 戰情室")
-        
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("#### 📊 收支表 (Income Statement)")
-            inc_salary = st.number_input("月薪資收入", 0, 1000000, 80000)
-            inc_passive = st.number_input("月被動收入", 0, 1000000, 10000)
-            exp_life = st.number_input("月生活支出", 0, 1000000, 30000)
-            exp_debt = st.number_input("月償債支出", 0, 1000000, 15000)
-            
-            net_saving = (inc_salary + inc_passive) - (exp_life + exp_debt)
-            save_rate = net_saving / (inc_salary + inc_passive) if (inc_salary + inc_passive) > 0 else 0
-            
-            st.metric("月淨儲蓄", f"${net_saving:,.0f}")
-            st.metric("儲蓄率", f"{save_rate:.1%}", delta="優秀" if save_rate > 0.3 else "需努力")
-
+            st.markdown("#### 收支表")
+            inc = st.number_input("月收入", value=80000)
+            exp = st.number_input("月支出", value=40000)
+            st.metric("儲蓄率", f"{(inc-exp)/inc:.1%}")
         with c2:
-            st.markdown("#### 🏦 資產負債表 (Balance Sheet)")
-            asset_invest = total_value
-            asset_home = st.number_input("自用房產價值", 0, 100000000, 15000000)
-            asset_cash = st.number_input("現金存款", 0, 10000000, 500000)
-            liab_home = st.number_input("房貸餘額", 0, 100000000, 8000000)
-            liab_other = st.number_input("信貸/車貸", 0, 10000000, 0)
-            
-            total_assets = asset_invest + asset_home + asset_cash
-            total_liab = liab_home + liab_other
-            net_worth = total_assets - total_liab
-            debt_ratio = total_liab / total_assets if total_assets > 0 else 0
-            
-            st.metric("總淨值 (Net Worth)", f"${net_worth:,.0f}")
-            st.metric("負債比", f"{debt_ratio:.1%}", delta="健康" if debt_ratio < 0.5 else "警戒", delta_color="inverse")
+            st.markdown("#### 資產負債表")
+            asset = total_value + st.number_input("房產+現金", value=15000000)
+            liab = st.number_input("總負債", value=8000000)
+            st.metric("淨值", f"${asset-liab:,.0f}")
 
     # === TAB 6: 房貸與目標 (Mortgage) ===
     with t6:
-        st.subheader("🏠 房貸與 FIRE 規劃")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("#### 房貸試算")
-            l_amt = st.number_input("貸款總額", 1000000, 50000000, 10000000)
-            l_yr = st.number_input("年限", 10, 40, 30)
-            l_rate = st.number_input("利率%", 1.0, 5.0, 2.2)
-            pmt = calc_mortgage(l_amt, l_yr, l_rate)
-            st.metric("月付金", f"${pmt:,.0f}")
-            
-        with c2:
-            st.markdown("#### Coast FIRE")
-            age = st.number_input("現齡", 20, 80, 35)
-            r_age = st.number_input("退齡", 40, 90, 60)
-            ret, df_fire = calc_coast_fire(age, r_age, net_worth, net_saving, 7.0, 2.5)
-            st.metric(f"{r_age}歲預估資產", f"${ret:,.0f}")
-            st.plotly_chart(px.area(df_fire, x='Age', y='Balance', title='資產累積'), use_container_width=True)
+        st.subheader("🏠 房貸與 FIRE")
+        l_amt = st.number_input("貸款總額", value=10000000)
+        l_rate = st.number_input("利率%", value=2.2)
+        pmt, tot_int = calc_mortgage(l_amt, 30, l_rate)
+        st.metric("月付金", f"${pmt:,.0f}")
+        st.metric("總利息", f"${tot_int:,.0f}")
 
 if __name__ == "__main__":
     main()
