@@ -9,35 +9,29 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 4.1: 全雲端戰略版", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Alpha 4.2: 戰略修正版", layout="wide", page_icon="🦅")
 
-# 自定義 CSS (黑金風格)
 st.markdown("""
 <style>
     .metric-card {background-color: #0E1117; border: 1px solid #262730; border-radius: 5px; padding: 15px; color: white;}
     .bullish {color: #00FF7F; font-weight: bold;}
     .bearish {color: #FF4B4B; font-weight: bold;}
     .neutral {color: #FFD700; font-weight: bold;}
-    .rrg-box {border: 1px solid #444; padding: 10px; border-radius: 5px; margin-bottom: 10px;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. 核心數據引擎 (網路實時抓取) ---
-@st.cache_data(ttl=1800) # 每30分鐘更新一次
+# --- 1. 數據引擎 ---
+@st.cache_data(ttl=1800)
 def fetch_market_data(tickers):
-    # 強制加入 SPY (基準), QQQ (科技基準), HYG (債券), VIX (恐慌)
     benchmarks = ['SPY', 'QQQ', 'BTC-USD', '^VIX', '^TNX', 'HYG']
     all_tickers = list(set(tickers + benchmarks))
     
     data = {col: {} for col in ['Close', 'Open', 'High', 'Low', 'Volume']}
-    
-    # 建立進度條
     progress_bar = st.progress(0, text="☁️ Alpha 正在連線華爾街資料庫...")
     
     for i, t in enumerate(all_tickers):
         try:
-            progress_bar.progress((i + 1) / len(all_tickers), text=f"下載數據中: {t} ...")
-            # 抓取 2 年數據以計算長期均線與 RRG
+            progress_bar.progress((i + 1) / len(all_tickers), text=f"下載: {t} ...")
             df = yf.Ticker(t).history(period="2y", auto_adjust=True)
             if df.empty: continue
             
@@ -49,7 +43,6 @@ def fetch_market_data(tickers):
         except: continue
             
     progress_bar.empty()
-    # 將 dict 轉為 DataFrame 並處理缺失值
     return (pd.DataFrame(data['Close']).ffill(), 
             pd.DataFrame(data['Open']).ffill(), 
             pd.DataFrame(data['High']).ffill(), 
@@ -69,100 +62,68 @@ def fetch_fred_liquidity(api_key):
         return df
     except: return None
 
-# --- 2. 進階數據引擎 (基本面/籌碼) ---
-@st.cache_data(ttl=3600*24) # 基本面一天更新一次即可
+@st.cache_data(ttl=3600*24)
 def get_advanced_info(ticker):
     try:
-        t = yf.Ticker(ticker)
-        info = t.info
-        
-        # A. 基本面 (Rule of 40)
-        # Yahoo Finance 數據通常是小數 (例如 0.25 代表 25%)
+        info = yf.Ticker(ticker).info
         rev_growth = info.get('revenueGrowth')
         profit_margin = info.get('profitMargins')
-        
-        rule_of_40 = None
-        if rev_growth is not None and profit_margin is not None:
-            rule_of_40 = (rev_growth + profit_margin) * 100
-            
-        # B. 機構籌碼
-        inst_held = info.get('heldPercentInstitutions')
-        insider_held = info.get('heldPercentInsiders')
-        short_ratio = info.get('shortRatio')
-        
-        # C. 華爾街目標
-        target_mean = info.get('targetMeanPrice')
+        rule_of_40 = (rev_growth + profit_margin) * 100 if (rev_growth and profit_margin) else None
         
         return {
             'Rule40': rule_of_40,
-            'Rev_Growth': rev_growth,
-            'Profit_Margin': profit_margin,
             'PEG': info.get('pegRatio'),
-            'Inst_Held': inst_held,
-            'Short_Ratio': short_ratio,
-            'Target_Mean': target_mean,
+            'Inst_Held': info.get('heldPercentInstitutions'),
+            'Short_Ratio': info.get('shortRatio'),
+            'Target_Mean': info.get('targetMeanPrice'),
             'PE': info.get('forwardPE')
         }
     except: return {}
 
-# --- 3. RRG 動態運算核心 (Python 實時版) ---
-def calc_rrg_metrics(df_close, tickers, benchmark='SPY'):
-    """
-    完全不依賴 Excel，直接用 Python 計算 JdK RRG 指標
-    """
-    if benchmark not in df_close.columns: return pd.DataFrame()
-    
-    rrg_data = []
-    bench_close = df_close[benchmark]
-    
-    for t in tickers:
-        if t not in df_close.columns or t == benchmark: continue
-        
-        # 1. 相對強度 (RS)
-        rs = df_close[t] / bench_close
-        
-        # 2. RRG 核心邏輯 (簡化版 JdK RS-Ratio)
-        # RS-Ratio = (短期RS均線 / 長期RS均線) * 100
-        # 這裡設定 Short=10天, Long=60天 (適合波段)
-        rs_mean_short = rs.rolling(10).mean()
-        rs_mean_long = rs.rolling(60).mean()
-        
-        if len(rs_mean_short.dropna()) < 60: continue
-
-        rs_ratio = (rs_mean_short / rs_mean_long * 100).iloc[-1]
-        
-        # 3. RS-Momentum (動能)
-        # RS-Momentum = (RS-Ratio 的變化率)
-        # ((當前 Ratio - 10天前 Ratio) * 係數) + 100
-        rs_ratio_series = rs_mean_short / rs_mean_long * 100
-        change = rs_ratio_series.iloc[-1] - rs_ratio_series.iloc[-10]
-        rs_momentum = (change * 5) + 100 # *5 是為了放大波動，讓圖表更易讀
-        
-        # 4. 象限判定
-        if rs_ratio > 100 and rs_momentum > 100: quadrant = "🟢 領先 (Leading)"
-        elif rs_ratio > 100 and rs_momentum < 100: quadrant = "🟡 轉弱 (Weakening)"
-        elif rs_ratio < 100 and rs_momentum < 100: quadrant = "🔴 落後 (Lagging)"
-        else: quadrant = "🔵 改善 (Improving)"
-        
-        rrg_data.append({
-            'Ticker': t,
-            'RS_Ratio': rs_ratio,
-            'RS_Momentum': rs_momentum,
-            'Quadrant': quadrant
-        })
-        
-    return pd.DataFrame(rrg_data)
-
-# --- 4. 輔助運算函式 ---
+# --- 2. 核心運算 ---
 def format_number(num):
     if num is None: return "N/A"
-    abs_num = abs(num)
-    if abs_num >= 1_000_000: return f"{num/1_000_000:.2f}M"
-    elif abs_num >= 1_000: return f"{num/1_000:.2f}K"
-    else: return f"{num:.2f}"
+    if abs(num) >= 1_000_000: return f"{num/1_000_000:.2f}M"
+    elif abs(num) >= 1_000: return f"{num/1_000:.2f}K"
+    return f"{num:.2f}"
+
+def calc_rrg_metrics(df_close, tickers, benchmark='SPY'):
+    if benchmark not in df_close.columns: return pd.DataFrame()
+    rrg_data = []
+    bench_close = df_close[benchmark]
+    for t in tickers:
+        if t not in df_close.columns or t == benchmark: continue
+        rs = df_close[t] / bench_close
+        rs_mean_short = rs.rolling(10).mean()
+        rs_mean_long = rs.rolling(60).mean()
+        if len(rs_mean_short.dropna()) < 60: continue
+        
+        rs_ratio = (rs_mean_short / rs_mean_long * 100).iloc[-1]
+        rs_ratio_series = rs_mean_short / rs_mean_long * 100
+        change = rs_ratio_series.iloc[-1] - rs_ratio_series.iloc[-10]
+        rs_momentum = (change * 5) + 100
+        
+        if rs_ratio > 100 and rs_momentum > 100: quadrant = "🟢 領先"
+        elif rs_ratio > 100 and rs_momentum < 100: quadrant = "🟡 轉弱"
+        elif rs_ratio < 100 and rs_momentum < 100: quadrant = "🔴 落後"
+        else: quadrant = "🔵 改善"
+        
+        rrg_data.append({'Ticker': t, 'RS_Ratio': rs_ratio, 'RS_Momentum': rs_momentum, 'Quadrant': quadrant})
+    return pd.DataFrame(rrg_data)
+
+def calc_mvrv_z_score(series):
+    """
+    計算 MVRV Z-Score (或價格偏離度 Z-Score)
+    Z = (Price - 200SMA) / StdDev(200)
+    """
+    try:
+        sma200 = series.rolling(200).mean()
+        std200 = series.rolling(200).std()
+        z_score = (series - sma200) / std200
+        return z_score
+    except: return None
 
 def calc_targets(close, high, low):
-    # 這裡一次計算三種目標，減少代碼重複
     if len(close) < 60: return None, None, None
     try:
         # ATR
@@ -175,7 +136,7 @@ def calc_targets(close, high, low):
         returns = close.pct_change().dropna()
         mu, sigma = returns.mean(), returns.std()
         sim_last = []
-        for _ in range(300): # 模擬300次
+        for _ in range(300):
             prices = [close.iloc[-1]]
             vol = np.random.normal(mu, sigma, 22)
             for v in vol: prices.append(prices[-1]*(1+v))
@@ -189,32 +150,34 @@ def calc_targets(close, high, low):
         return t_atr, t_mc, t_fib
     except: return None, None, None
 
-def calc_fund_flow(close, volume):
-    if volume is None or volume.empty: return None, None
-    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
-    
-    # 斜率
-    y, x = obv.values[-20:].reshape(-1, 1), np.arange(20).reshape(-1, 1)
-    slope = LinearRegression().fit(x, y).coef_[0].item()
-    
-    return slope, obv
-
 def analyze_trend(series):
     if series is None or len(series) < 200: return None
     p_now = series.iloc[-1]
     sma200 = series.rolling(200).mean().iloc[-1]
+    ema20 = series.ewm(span=20).mean().iloc[-1]
     
+    # 修正後的邏輯
     status = "🛡️ 區間"
-    if p_now < sma200: status = "🛑 熊市"
-    elif p_now > series.ewm(span=20).mean().iloc[-1]: status = "🔥 進攻"
+    if p_now > sma200 and p_now > ema20: status = "🔥 強勢"
+    elif p_now > sma200 and p_now < ema20: status = "⚠️ 整理"
+    elif p_now < sma200 and p_now > sma200 * 0.85: status = "📉 回調 (洗盤)" # 修正這裡
+    elif p_now < sma200 * 0.85: status = "🛑 熊市"
     
-    # 預測
-    y, x = series.dropna().values.reshape(-1, 1), np.arange(len(series.dropna())).reshape(-1, 1)
+    y = series.dropna().values.reshape(-1, 1)
+    x = np.arange(len(y)).reshape(-1, 1)
     model = LinearRegression().fit(x, y)
     p_2w = model.predict([[len(y)+10]])[0].item()
     p_1m = model.predict([[len(y)+22]])[0].item()
     
     return {"status": status, "p_now": p_now, "p_2w": p_2w, "p_1m": p_1m, "sma200": sma200}
+
+def calc_fund_flow(close, volume):
+    if volume is None or volume.empty: return None, None
+    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    y = obv.values[-20:].reshape(-1, 1)
+    x = np.arange(20).reshape(-1, 1)
+    slope = LinearRegression().fit(x, y).coef_[0].item()
+    return slope, obv
 
 def parse_input(text):
     port = {}
@@ -225,161 +188,117 @@ def parse_input(text):
             except: port[parts[0].strip().upper()] = 0.0
     return port
 
-# --- MAIN APP ---
+# --- MAIN ---
 def main():
-    st.title("Alpha 4.1: 全雲端戰略版")
-    st.caption("v4.1 | 移除 Excel 依賴 | RRG / 籌碼 / 財報 實時連線")
+    st.title("Alpha 4.2: 戰略修正版")
+    st.caption("v4.2 | MVRV 回歸 | 趨勢判定優化 | 公式白皮書")
     st.markdown("---")
 
     with st.sidebar:
-        st.header("⚙️ 參數設定")
-        fred_key = st.secrets.get("FRED_API_KEY", st.text_input("FRED API Key (選填)", type="password"))
-        
-        st.header("💼 資產配置")
+        st.header("⚙️ 設定")
+        fred_key = st.secrets.get("FRED_API_KEY", st.text_input("FRED API Key", type="password"))
+        st.header("💼 資產")
         default_input = """BTC-USD, 10000
 AMD, 10000
 NVDA, 10000
 PLTR, 5000"""
-        user_input = st.text_area("持倉清單", default_input, height=200)
+        user_input = st.text_area("清單", default_input, height=200)
         portfolio_dict = parse_input(user_input)
         tickers_list = list(portfolio_dict.keys())
         total_value = sum(portfolio_dict.values())
-        st.metric("總資產估值 (Est.)", f"${total_value:,.0f}")
-        
-        # 新增：簡易財務目標 (取代 Excel)
-        with st.expander("💰 簡易財務目標 (FIRE)"):
-            goal = st.number_input("退休目標金額", value=30000000)
-            st.progress(min(total_value / goal, 1.0))
-            st.caption(f"達成率: {total_value/goal:.1%}")
-
+        st.metric("總估值", f"${total_value:,.0f}")
         if st.button("🚀 啟動全域掃描", type="primary"): st.session_state['run'] = True
 
-    if not st.session_state.get('run', False):
-        st.info("👈 請點擊『啟動全域掃描』。系統將直接連線華爾街資料庫。")
-        return
+    if not st.session_state.get('run', False): return
 
-    # --- 數據下載區 ---
-    with st.spinner("☁️ Alpha 正在雲端下載與運算..."):
+    with st.spinner("計算中..."):
         df_close, df_open, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_liquidity = fetch_fred_liquidity(fred_key)
         adv_data = {t: get_advanced_info(t) for t in tickers_list}
 
-    if df_close.empty: st.error("數據獲取失敗，請檢查代號是否正確。"); return
+    if df_close.empty: st.error("No Data"); return
 
-    # --- 1. 宏觀 (Macro) ---
-    st.subheader("1. 宏觀與流動性 (Macro & Liquidity)")
-    vix = df_close.get('^VIX').iloc[-1] if '^VIX' in df_close else None
-    hyg = analyze_trend(df_close.get('HYG'))
-    
-    liq_s = "未知"
-    if df_liquidity is not None:
-        curr, prev = df_liquidity['Net_Liquidity'].iloc[-1], df_liquidity['Net_Liquidity'].iloc[-5]
-        liq_s = "擴張 (印鈔中)" if curr > prev else "收縮 (抽水中)"
-    
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("美元淨流動性", liq_s, f"${df_liquidity['Net_Liquidity'].iloc[-1]:.2f}T" if df_liquidity is not None else "No Key")
-    with c2: st.metric("信用市場 (HYG)", "充裕" if hyg and hyg['p_now'] > hyg['sma200'] else "枯竭")
-    with c3: st.metric("VIX 恐慌指數", f"{vix:.2f}" if vix else "N/A", delta="風暴" if vix and vix>22 else "平靜", delta_color="inverse")
-    st.markdown("---")
-
-    # --- 2. RRG 動態輪動 (Live Calculation) ---
-    st.subheader("2. 雲端 RRG 板塊輪動 (Live RRG)")
-    st.markdown("直接運算 **相對於 SPY** 的強度與動能。不依賴 Excel，即時顯示資金流向。")
-    
+    # --- 1. RRG ---
+    st.subheader("1. 資金流向 (RRG & Macro)")
     rrg_df = calc_rrg_metrics(df_close, tickers_list)
     if not rrg_df.empty:
-        fig_rrg = px.scatter(rrg_df, x='RS_Ratio', y='RS_Momentum', color='Quadrant', text='Ticker',
-                             title="RRG 動態輪動 (vs SPY)", 
-                             color_discrete_map={'🟢 領先 (Leading)': '#00FF7F', '🟡 轉弱 (Weakening)': '#FFFF00',
-                                                 '🔴 落後 (Lagging)': '#FF4B4B', '🔵 改善 (Improving)': '#00BFFF'})
-        # 畫十字線
-        fig_rrg.add_vline(x=100, line_width=1, line_dash="dash", line_color="gray")
-        fig_rrg.add_hline(y=100, line_width=1, line_dash="dash", line_color="gray")
-        fig_rrg.update_layout(xaxis_title="RS-Ratio (趨勢強度)", yaxis_title="RS-Momentum (動能速度)", height=500)
+        fig_rrg = px.scatter(rrg_df, x='RS_Ratio', y='RS_Momentum', color='Quadrant', text='Ticker', title="RRG 動能輪動 (vs SPY)", 
+                             color_discrete_map={'🟢 領先': '#00FF7F', '🟡 轉弱': '#FFFF00', '🔴 落後': '#FF4B4B', '🔵 改善': '#00BFFF'})
+        fig_rrg.add_vline(x=100, line_dash="dash", line_color="gray"); fig_rrg.add_hline(y=100, line_dash="dash", line_color="gray")
         st.plotly_chart(fig_rrg, use_container_width=True)
-    else:
-        st.warning("⚠️ 數據不足，無法繪製 RRG (需要至少 60 天歷史數據)。")
-    st.markdown("---")
-
-    # --- 3. 深度審計 (Deep Audit) ---
-    st.subheader("3. 深度資產審計 (Fundamental & Institutional)")
+    
+    # --- 2. 深度審計 ---
+    st.subheader("2. 深度審計 (Deep Audit)")
     
     for ticker in tickers_list:
         if ticker not in df_close.columns: continue
         trend = analyze_trend(df_close[ticker])
-        slope, obv_series = calc_fund_flow(df_close[ticker], df_vol[ticker])
+        slope, obv = calc_fund_flow(df_close[ticker], df_vol[ticker])
         info = adv_data.get(ticker, {})
-        
-        # 三角定位
         t_atr, t_mc, t_fib = calc_targets(df_close[ticker], df_high[ticker], df_low[ticker])
         
-        # Rule of 40
-        r40 = info.get('Rule40')
-        r40_badge = "✅ 通過" if r40 and r40 > 40 else ("❌ 未通過" if r40 else "N/A")
+        # MVRV Z-Score 計算
+        z_score_series = calc_mvrv_z_score(df_close[ticker])
+        z_now = z_score_series.iloc[-1] if z_score_series is not None else 0
+        z_color = "red" if z_now > 2 else ("green" if z_now < 0 else "orange")
         
-        # 繪圖
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df_close.index[-100:], y=df_close[ticker].iloc[-100:], name='Price', line=dict(color='#00FF7F')))
-        if obv_series is not None:
-             fig.add_trace(go.Scatter(x=df_close.index[-100:], y=obv_series.iloc[-100:], name='OBV', line=dict(color='#00BFFF'), yaxis='y2'))
-        fig.update_layout(height=300, margin=dict(l=0,r=0,t=30,b=0),
-                          yaxis2=dict(overlaying='y', side='right', showgrid=False))
-
-        with st.expander(f"📊 {ticker} - {trend['status']} | Rule of 40: {r40_badge}", expanded=True):
+        with st.expander(f"📊 {ticker} - {trend['status']} | MVRV-Z: {z_now:.2f}", expanded=True):
             k1, k2, k3 = st.columns([2, 1, 1])
             
-            with k1: # 技術與圖表
-                st.markdown("#### 🎯 四角定位 & 走勢")
-                col_a, col_b = st.columns(2)
-                col_a.write(f"**ATR Target:** ${t_atr:.2f}" if t_atr else "-")
-                col_a.write(f"**Monte Carlo:** ${t_mc:.2f}" if t_mc else "-")
-                col_b.write(f"**Fibonacci:** ${t_fib:.2f}" if t_fib else "-")
-                col_b.write(f"**Wall St.:** ${info.get('Target_Mean')}" if info.get('Target_Mean') else "-")
+            with k1: # 圖表
+                st.markdown("#### 📈 MVRV Z-Score (估值位階)")
+                # 雙軸圖：價格 + Z-Score
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df_close.index[-200:], y=df_close[ticker].iloc[-200:], name='Price', line=dict(color='white')))
+                # 副圖 Z-Score
+                fig.add_trace(go.Scatter(x=df_close.index[-200:], y=z_score_series.iloc[-200:], name='Z-Score', line=dict(color='cyan'), yaxis='y2'))
+                fig.update_layout(height=300, yaxis2=dict(overlaying='y', side='right', showgrid=False, title='Z-Score'))
+                # 畫出 Z=0 和 Z=2 的線
+                fig.add_hline(y=2, line_dash="dot", line_color="red", yref="y2", annotation_text="Overvalued")
+                fig.add_hline(y=0, line_dash="dot", line_color="green", yref="y2", annotation_text="Fair Value")
                 st.plotly_chart(fig, use_container_width=True)
 
-            with k2: # 籌碼 (Live)
-                st.markdown("#### 🏦 機構籌碼")
+            with k2: # 籌碼
+                st.markdown("#### 🎯 目標價與籌碼")
+                st.write(f"**Monte Carlo:** ${t_mc:.2f}")
+                st.write(f"**Analyst:** ${info.get('Target_Mean')}" if info.get('Target_Mean') else "-")
                 inst = info.get('Inst_Held')
-                st.metric("機構持股比", f"{inst*100:.1f}%" if inst else "N/A", 
-                          delta="高度控盤" if inst and inst > 0.7 else "散戶多")
-                
-                obv_s = "吸籌" if slope and slope > 0 else "出貨"
-                st.metric("OBV 資金流", format_number(slope), obv_s)
-                st.caption(f"空單比例: {info.get('Short_Ratio', 0)}")
+                st.metric("機構持股", f"{inst*100:.1f}%" if inst else "-", delta="高度控盤" if inst and inst > 0.7 else "散戶多")
+                st.metric("OBV 斜率", format_number(slope), "吸籌" if slope>0 else "出貨")
 
-            with k3: # 基本面 (Live)
-                st.markdown("#### 💎 財報體質")
-                st.metric("Rule of 40", f"{r40:.1f}" if r40 else "N/A", delta=r40_badge)
-                peg = info.get('PEG')
-                st.metric("PEG 估值", f"{peg}" if peg else "N/A", delta="低估" if peg and peg < 1 else "偏高", delta_color="inverse")
-                
-                st.write("**三階段推演:**")
-                st.caption(f"2週: ${trend['p_2w']:.2f}")
-                st.caption(f"1月: ${trend['p_1m']:.2f}")
+            with k3: # 基本面
+                st.markdown("#### 💎 財務體質")
+                r40 = info.get('Rule40')
+                r40_icon = "✅" if r40 and r40>40 else "❌"
+                st.metric("Rule of 40", f"{r40:.1f}" if r40 else "-", delta=r40_icon)
+                st.metric("Forward P/E", f"{info.get('PE', 'N/A')}")
+                st.caption(f"2週預測: ${trend['p_2w']:.2f}")
 
+    # --- 3. 公式白皮書 ---
     st.markdown("---")
+    st.header("3. 量化模型公式手冊 (Formulas)")
     
-    # --- 4. 總表 ---
-    st.subheader("4. 資產配置總表")
-    table_data = []
-    for ticker in tickers_list:
-        if ticker not in df_close.columns: continue
-        trend = analyze_trend(df_close[ticker])
-        info = adv_data.get(ticker, {})
-        slope, _ = calc_fund_flow(df_close[ticker], df_vol[ticker])
-        
-        table_data.append({
-            "代號": ticker,
-            "現價": f"${trend['p_now']:.2f}",
-            "趨勢": trend['status'],
-            "Rule 40": f"{info.get('Rule40', 0):.1f}" if info.get('Rule40') else "-",
-            "機構持股": f"{info.get('Inst_Held', 0)*100:.0f}%" if info.get('Inst_Held') else "-",
-            "OBV": "流入" if slope and slope > 0 else "流出"
-        })
-    st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    st.info("💡 系統說明：本版本所有數據 (股價、財報、籌碼) 皆透過 API 實時連線華爾街資料庫，無須上傳 Excel。")
+    with st.container():
+        c1, c2 = st.columns(2)
+        with c1:
+            st.info("### 📐 MVRV Z-Score (估值偏離度)")
+            st.latex(r'''Z = \frac{P_{now} - SMA_{200}}{\sigma_{200}}''')
+            st.markdown("* **Z > 2.0:** 價格過熱 (Overvalued)，注意回調。\n* **Z < 0.0:** 價格低於長期均線 (Undervalued)，潛在買點。")
+            
+            st.divider()
+            st.info("### 🌀 RRG 相對強度 (JdK RS-Ratio)")
+            st.latex(r'''RS = \frac{Price_{Stock}}{Price_{SPY}} \times 100''')
+            st.latex(r'''\text{Ratio} = \frac{MA_{10}(RS)}{MA_{60}(RS)} \times 100''')
+            
+        with c2:
+            st.info("### 💎 Rule of 40 (SaaS 估值)")
+            st.latex(r'''R_{40} = \text{Revenue Growth (\%)} + \text{Profit Margin (\%)}''')
+            st.markdown("* **> 40:** 優質成長股 (如 PLTR, CRWD)。\n* **< 40:** 體質尚需改善。")
+            
+            st.divider()
+            st.info("### 🎲 Monte Carlo (蒙地卡羅預測)")
+            st.latex(r'''P_{t} = P_{t-1} \times e^{(\mu - \frac{\sigma^2}{2})\Delta t + \sigma \epsilon \sqrt{\Delta t}}''')
+            st.markdown("透過幾何布朗運動 (GBM) 模擬 300 次未來路徑，取中位數 (P50) 為目標價。")
 
 if __name__ == "__main__":
     main()
