@@ -114,6 +114,9 @@ def calc_rrg_metrics(df_close, tickers, benchmark='SPY'):
         # 這裡用簡化版算法：RS的短期均線 / RS的長期均線 * 100
         rs_mean_short = rs.rolling(10).mean()
         rs_mean_long = rs.rolling(100).mean()
+        
+        if len(rs_mean_short) < 100: continue # 資料不足跳過
+
         rs_ratio = (rs_mean_short / rs_mean_long * 100).iloc[-1]
         
         # 3. JdK RS-Momentum (動能): RS-Ratio 的變化率
@@ -178,11 +181,17 @@ def calc_fund_flow(close, high, low, volume):
     y, x = obv.values[-20:].reshape(-1, 1), np.arange(20).reshape(-1, 1)
     slope = LinearRegression().fit(x, y).coef_[0].item()
     
-    tp = (high + low + close) / 3
-    mf = tp * volume
-    pos = np.where(tp > tp.shift(1), mf, 0)
-    neg = np.where(tp < tp.shift(1), mf, 0)
-    mfi = 100 - (100 / (1 + pd.Series(pos).rolling(14).sum().iloc[-1] / pd.Series(neg).rolling(14).sum().iloc[-1]))
+    typical_price = (high + low + close) / 3
+    money_flow = typical_price * volume
+    pos = np.where(typical_price > typical_price.shift(1), money_flow, 0)
+    neg = np.where(typical_price < typical_price.shift(1), money_flow, 0)
+    
+    pos_sum_s = pd.Series(pos).rolling(14).sum().iloc[-1]
+    neg_sum_s = pd.Series(neg).rolling(14).sum().iloc[-1]
+    
+    if neg_sum_s == 0: mfi = 100
+    else: mfi = 100 - (100 / (1 + pos_sum_s / neg_sum_s))
+    
     return {"obv_slope": slope, "mfi": mfi, "obv_series": obv}
 
 def analyze_trend(series):
@@ -231,7 +240,11 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ 參數設定")
-        fred_key = st.secrets.get("FRED_API_KEY", st.text_input("FRED API Key (選填)", type="password"))
+        fred_key = st.secrets.get("FRED_API_KEY", None)
+        if fred_key:
+             st.success("🔑 FRED Key 已載入")
+        else:
+             fred_key = st.text_input("FRED API Key (選填)", type="password")
         
         st.header("💼 資產配置")
         # [更新] 預設資產配置為 BTC 和 AMD
@@ -268,14 +281,14 @@ AMD, 10000"""
         liq_status = "擴張 (印鈔中)" if curr > prev else "收縮 (抽水中)"
         liq_trend_val = "擴張" if curr > prev else "收縮"
     
-    qqq_trend = analyze_trend(df_close.get('QQQ')) # 如果沒有 QQQ 會回傳 None
-    gear, reason = determine_strategy_gear(qqq_trend, vix, None, hyg_trend, liq_trend_val)
+    qqq_trend = analyze_trend(df_close.get('QQQ'))
+    gear, reason = determine_strategy_gear(qqq_trend, vix, hyg_trend, liq_trend_val)
     
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("美元淨流動性", liq_status, f"${df_liquidity['Net_Liquidity'].iloc[-1]:.2f}T" if df_liquidity is not None else "No Key")
-    c2.metric("信用市場 (HYG)", "充裕" if hyg_trend and hyg_trend['p_now'] > hyg_trend['sma200'] else "枯竭")
-    c3.metric("VIX", f"{vix:.2f}" if vix else "N/A")
-    c4.metric("Alpha 指令", gear)
+    with c1: st.metric("美元淨流動性", liq_status, f"${df_liquidity['Net_Liquidity'].iloc[-1]:.2f}T" if df_liquidity is not None else "No Key")
+    with c2: st.metric("信用市場 (HYG)", "充裕" if hyg_trend and hyg_trend['p_now'] > hyg_trend['sma200'] else "枯竭")
+    with c3: st.metric("VIX", f"{vix:.2f}" if vix else "N/A")
+    with c4: st.metric("Alpha 指令", gear)
     
     if "收縮" in liq_status: st.warning(f"⚠️ {reason}")
     else: st.success(f"✅ {reason}")
