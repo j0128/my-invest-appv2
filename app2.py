@@ -424,6 +424,59 @@ def main():
         amt=st.number_input("貸",10000000); rt=st.number_input("率",2.2)
         pmt,_=calc_mortgage(amt,30,rt)
         st.metric("月付", f"${pmt:,.0f}")
+    with t7:
+        st.subheader("📈 實戰買入賣出實驗室 (Strategy Lab Pro)")
+        st.info("💡 模擬情境：過去300天，初始本金$10,000，每個月1號發薪水再存入$10,000。實驗組將嚴格執行 CFO V3 的所有買賣指令。")
+        
+        # 全市場選單
+        avail_tickers = [c for c in df_close.columns if not (c.startswith('^') or c.endswith('=F'))]
+        benchs = ['SPY', 'QQQ', 'TQQQ', 'TLT']
+        final_list = sorted(list(set(avail_tickers + benchs)))
+        
+        lab_ticker = st.selectbox("選擇回測標的 (包含全市場)", final_list)
+        
+        if lab_ticker in df_close.columns:
+            # 執行回測 (傳入 Volume 以計算 Vol_Ratio)
+            res_1d, roi_1d, strat_roi_1d, inv_1d, end_dca, end_1d = run_strategy_backtest(
+                df_close[lab_ticker].to_frame(name='Close'), 
+                df_vol[lab_ticker], 
+                frequency_days=1
+            )
+            res_3d, roi_3d, strat_roi_3d, inv_3d, _, end_3d = run_strategy_backtest(
+                df_close[lab_ticker].to_frame(name='Close'), 
+                df_vol[lab_ticker],
+                frequency_days=3
+            )
+            res_7d, roi_7d, strat_roi_7d, inv_7d, _, end_7d = run_strategy_backtest(
+                df_close[lab_ticker].to_frame(name='Close'), 
+                df_vol[lab_ticker],
+                frequency_days=7
+            )
+            
+            if res_1d is not None:
+                # 顯示結果 Metrics
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("總投入本金", f"${inv_1d:,.0f}")
+                k2.metric("無腦定投 (DCA) 淨值", f"${end_dca:,.0f}", f"ROI: {roi_1d:.1%}")
+                
+                # 策略比較表
+                strat_data = [
+                    {"策略頻率": "每日看盤 (Daily)", "最終淨值": f"${end_1d:,.0f}", "總報酬率 (ROI)": f"{strat_roi_1d:.1%}", "本益比": f"{(end_1d-inv_1d)/inv_1d:.2f}"},
+                    {"策略頻率": "每3天一次 (3-Day)", "最終淨值": f"${end_3d:,.0f}", "總報酬率 (ROI)": f"{strat_roi_3d:.1%}", "本益比": f"{(end_3d-inv_3d)/inv_3d:.2f}"},
+                    {"策略頻率": "每週一次 (Weekly)", "最終淨值": f"${end_7d:,.0f}", "總報酬率 (ROI)": f"{strat_roi_7d:.1%}", "本益比": f"{(end_7d-inv_7d)/inv_7d:.2f}"},
+                ]
+                st.table(pd.DataFrame(strat_data))
+                
+                # 畫圖
+                st.markdown("#### 📊 資金曲線對決 (CFO Strategy vs DCA)")
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=res_1d.index, y=res_1d['DCA_Value'], name='無腦定投 (DCA)', line=dict(color='gray', dash='dash')))
+                fig.add_trace(go.Scatter(x=res_1d.index, y=res_1d['Strat_Value'], name='CFO 策略 (Daily)', line=dict(color='#00BFFF', width=2)))
+                fig.add_trace(go.Scatter(x=res_1d.index, y=res_1d['Invested'], name='投入本金', line=dict(color='green', width=1)))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("數據不足 300 天，無法進行完整回測。")
+
 
 if __name__ == "__main__":
     main()
