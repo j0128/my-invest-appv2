@@ -8,8 +8,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
-# --- 0. 全局設定 (戰略黑金版) ---
-st.set_page_config(page_title="Alpha 5.0: 戰略地平線", layout="wide", page_icon="🦅")
+# --- 0. 全局設定 ---
+st.set_page_config(page_title="Alpha 5.1: 戰略地平線 Pro", layout="wide", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -17,25 +17,24 @@ st.markdown("""
     .bullish {color: #00FF7F; font-weight: bold;}
     .bearish {color: #FF4B4B; font-weight: bold;}
     .neutral {color: #FFD700; font-weight: bold;}
-    .highlight-box {border-left: 5px solid #00BFFF; background-color: #1a1a1a; padding: 10px; margin: 10px 0;}
+    .explanation-box {background-color: #1a1a1a; padding: 20px; border-radius: 10px; border-left: 5px solid #00BFFF;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. 核心數據引擎 (宏觀+個股) ---
+# --- 1. 核心數據引擎 ---
 @st.cache_data(ttl=1800)
 def fetch_market_data(tickers):
-    # 增加宏觀指標: 10年債(^TNX), 恐慌(^VIX), 短債/Fed預期(^IRX)
     benchmarks = ['SPY', 'QQQ', '^VIX', '^TNX', '^IRX', 'HYG'] 
     all_tickers = list(set(tickers + benchmarks))
     
     data = {col: {} for col in ['Close', 'Open', 'High', 'Low', 'Volume']}
-    progress_bar = st.progress(0, text="🦅 Alpha 5.0 正在掃描正負六個月戰略區間...")
+    progress_bar = st.progress(0, text="🦅 Alpha 5.1 正在建立正負六個月戰略模型...")
     
     for i, t in enumerate(all_tickers):
         try:
-            progress_bar.progress((i + 1) / len(all_tickers), text=f"連線中: {t} ...")
-            # 抓取 1 年數據，以確保能完整計算 6 個月的技術指標
-            df = yf.Ticker(t).history(period="1y", auto_adjust=True)
+            progress_bar.progress((i + 1) / len(all_tickers), text=f"下載: {t} ...")
+            # 抓取 1.5 年數據，確保能運算過去 1 年的波動率與回測
+            df = yf.Ticker(t).history(period="2y", auto_adjust=True)
             if df.empty: continue
             
             data['Close'][t] = df['Close']
@@ -53,141 +52,130 @@ def fetch_market_data(tickers):
 
 @st.cache_data(ttl=3600*12)
 def fetch_fred_macro(api_key):
-    """抓取 Fed 真實流動性與利率"""
     if not api_key: return None
     try:
         fred = Fred(api_key=api_key)
-        # WALCL: Fed資產, WTREGEN: TGA帳戶, RRPONTSYD: 逆回購
         walcl = fred.get_series('WALCL', observation_start='2024-01-01')
         tga = fred.get_series('WTREGEN', observation_start='2024-01-01')
         rrp = fred.get_series('RRPONTSYD', observation_start='2024-01-01')
-        fed_funds = fred.get_series('FEDFUNDS', observation_start='2023-01-01') # 聯邦基金利率
+        rate = fred.get_series('FEDFUNDS', observation_start='2024-01-01')
         
-        df = pd.DataFrame({'WALCL': walcl, 'TGA': tga, 'RRP': rrp, 'RATE': fed_funds}).ffill().dropna()
-        df['Net_Liquidity'] = (df['WALCL'] - df['TGA'] - df['RRP']) / 1000 
+        df = pd.DataFrame({'WALCL': walcl, 'TGA': tga, 'RRP': rrp, 'RATE': rate}).ffill().dropna()
+        df['Net_Liquidity'] = (df['WALCL'] - df['TGA'] - df['RRP']) / 1000 # 單位: 兆
         return df
     except: return None
 
 @st.cache_data(ttl=3600*24)
 def get_fundamental_anchor(ticker):
-    """基本面錨點 (DCF/PE/Analyst)"""
     try:
         info = yf.Ticker(ticker).info
         return {
-            'Target_Mean': info.get('targetMeanPrice'), # 華爾街共識 (隱含 DCF/PE)
+            'Target_Mean': info.get('targetMeanPrice'), # 華爾街 DCF/PE 共識
             'Forward_PE': info.get('forwardPE'),
-            'Trailing_PE': info.get('trailingPE'),
             'PEG': info.get('pegRatio'),
-            'Recommendation': info.get('recommendationKey')
+            'High_52w': info.get('fiftyTwoWeekHigh'),
+            'Low_52w': info.get('fiftyTwoWeekLow')
         }
     except: return {}
 
 # --- 2. 核心運算模型 ---
 
-def calc_kelly_criterion(trend_data, win_rate=0.55, odds=2.0):
-    """
-    凱利公式 (半凱利模式)
-    f* = (p(b+1) - 1) / b
-    """
-    if not trend_data: return "0%"
-    # 動態調整勝率
-    if "Bull" in trend_data['status']: win_rate += 0.1
-    if "Bear" in trend_data['status']: win_rate -= 0.15
-    
+def calc_kelly(trend_status, win_rate=0.55, odds=2.0):
+    if "Bull" in trend_status: win_rate += 0.1
+    if "Bear" in trend_status: win_rate -= 0.15
     f_star = (win_rate * (odds + 1) - 1) / odds
-    safe_kelly = max(0, f_star * 0.5) # 半凱利，安全第一
-    return f"{safe_kelly*100:.1f}%"
+    return max(0, f_star * 0.5) # 半凱利
 
-def calc_quad_targets(close, high, low, f_data):
+def calc_targets_v2(close, high, low, f_data, days_forecast=22):
     """
-    四角定位運算 (含時間維度)
+    四種模型計算目標價
     """
-    if len(close) < 60: return None, None, None, None
-    try:
-        current_price = close.iloc[-1]
-        
-        # 1. ATR (物理極限) - 預測 1個月 (22天)
-        tr = pd.concat([high-low, (high-close.shift(1)).abs(), (low-close.shift(1)).abs()], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean().iloc[-1]
-        t_atr = current_price + (atr * np.sqrt(22) * 1.5) # 1.5倍月波動作為極限
-        
-        # 2. Monte Carlo (統計中樞) - 預測 1個月
-        returns = close.pct_change().dropna()
-        mu, sigma = returns.mean(), returns.std()
-        sims = []
-        for _ in range(500):
-            p = current_price
-            for _ in range(22): p *= (1 + np.random.normal(mu, sigma))
-            sims.append(p)
-        t_mc = np.percentile(sims, 50)
-        
-        # 3. Fibonacci (群眾心理) - 過去 6 個月高點擴展
-        lookback = 126 # 6個月 (約126交易日)
-        recent = close.iloc[-lookback:]
-        h, l = recent.max(), recent.min()
-        t_fib = h + (h - l) * 0.618
-        
-        # 4. Fundamental (價值)
-        t_fund = f_data.get('Target_Mean')
-        
-        return t_atr, t_mc, t_fib, t_fund
-    except: return None, None, None, None
+    if len(close) < 252: return None
+    p_now = close.iloc[-1]
+    
+    # 1. ATR (物理極限) - 基於 days_forecast (預設1個月=22天)
+    # 假設未來波動率不變，計算合理極限
+    tr = pd.concat([high-low, (high-close.shift(1)).abs(), (low-close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().iloc[-1]
+    # 公式: 現價 + (ATR * sqrt(天數) * 係數)
+    t_atr = p_now + (atr * np.sqrt(days_forecast) * 1.2) 
+    
+    # 2. Monte Carlo (統計中樞 P50)
+    returns = close.iloc[-252:].pct_change().dropna() # 過去一年波動
+    mu, sigma = returns.mean(), returns.std()
+    sims = []
+    for _ in range(1000): # 1000次模擬
+        p = p_now
+        # 模擬未來 days_forecast 天
+        for _ in range(days_forecast):
+            p *= (1 + np.random.normal(mu, sigma))
+        sims.append(p)
+    t_mc = np.percentile(sims, 50) # P50 中位數
+    
+    # 3. Fibonacci (群眾心理)
+    # 抓過去一季 (60天) 高低點
+    recent = close.iloc[-60:]
+    h, l = recent.max(), recent.min()
+    t_fib = h + (h - l) * 0.618 # 1.618 擴展
+    
+    # 4. Fundamental (價值) - DCF/Forward PE
+    t_fund = f_data.get('Target_Mean') # 華爾街共識目標 (通常是12個月)
+    
+    return t_atr, t_mc, t_fib, t_fund
 
-def analyze_trend_6m(series):
-    """
-    正負六個月趨勢判定 (Regime Filter)
-    """
-    if series is None or len(series) < 126: return None
+def run_backtest(close, high, low, days_ago=22):
+    """回測實驗室: 驗證 N 天前的模型預測"""
+    if len(close) < 300: return None
     
-    p_now = series.iloc[-1]
-    sma200 = series.rolling(200).mean().iloc[-1]
-    sma50 = series.rolling(50).mean().iloc[-1]
-    
-    # 趨勢斜率 (過去 6 個月)
-    y = series.iloc[-126:].values.reshape(-1, 1)
-    x = np.arange(len(y)).reshape(-1, 1)
-    model = LinearRegression().fit(x, y)
-    
-    # 預測未來 (2週, 1月, 3月)
-    p_2w = model.predict([[len(y)+10]])[0].item()
-    p_1m = model.predict([[len(y)+22]])[0].item()
-    p_3m = model.predict([[len(y)+66]])[0].item()
-    
-    # 修正後的狀態判定
-    if p_now > sma200:
-        if p_now > sma50: status = "🔥 強勢牛 (Bull)"
-        else: status = "⚠️ 回調 (Correction)"
-    else:
-        # 如果跌破年線但在 88% 以上，視為假跌破/弱勢整理，而非熊市
-        if p_now > sma200 * 0.88: status = "📉 弱勢整理 (Weak)"
-        else: status = "🛑 熊市 (Bear)"
-        
-    return {"status": status, "p_now": p_now, "p_2w": p_2w, "p_1m": p_1m, "p_3m": p_3m, "sma200": sma200}
-
-def backtest_lab(ticker, close, high, low):
-    """
-    回測實驗室：驗證 1 個月前的預測準不準
-    """
-    if len(close) < 250: return None
-    
-    # 回到 22 天前
-    idx_past = len(close) - 22 - 1
+    idx_past = len(close) - days_ago - 1
     p_past = close.iloc[idx_past]
     p_now = close.iloc[-1]
     
-    # 用當時數據算目標
+    # 切片數據
     c_slice = close.iloc[:idx_past+1]
     h_slice = high.iloc[:idx_past+1]
     l_slice = low.iloc[:idx_past+1]
     
-    # 簡化版計算
+    # 1. 回測 ATR
     tr = pd.concat([h_slice-l_slice], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().iloc[-1]
-    pred_atr = p_past + (atr * np.sqrt(22) * 1.5)
+    pred_atr = p_past + (atr * np.sqrt(days_ago) * 1.2)
+    err_atr = (pred_atr - p_now) / p_now
     
-    # 誤差
-    err = (pred_atr - p_now) / p_now
-    return {"pred": pred_atr, "actual": p_now, "error": err}
+    # 2. 回測 MC (簡化版)
+    # 由於無法重跑 1000 次模擬的隨機性，這裡比較「當時的預期波動範圍」是否涵蓋今日價格
+    
+    return {"ATR_Error": err_atr, "Price_Past": p_past, "Price_Now": p_now}
+
+def analyze_trend_matrix(series):
+    """
+    計算 2週, 1月, 3月 的線性回歸預測
+    """
+    if len(series) < 126: return None
+    
+    # 使用過去半年 (126天) 的數據建立趨勢線
+    y = series.iloc[-126:].values.reshape(-1, 1)
+    x = np.arange(len(y)).reshape(-1, 1)
+    model = LinearRegression().fit(x, y)
+    
+    # 預測未來
+    p_2w = model.predict([[len(y)+10]])[0].item() # 2週
+    p_1m = model.predict([[len(y)+22]])[0].item() # 1月
+    p_3m = model.predict([[len(y)+66]])[0].item() # 3月
+    
+    p_now = series.iloc[-1]
+    sma200 = series.rolling(200).mean().iloc[-1]
+    
+    status = "🛡️ 區間震盪"
+    if p_now > sma200: status = "🔥 多頭 (Bull)"
+    elif p_now < sma200 * 0.9: status = "🛑 空頭 (Bear)"
+    else: status = "⚠️ 弱勢整理"
+        
+    return {"p_2w": p_2w, "p_1m": p_1m, "p_3m": p_3m, "status": status}
+
+def calc_obv(close, volume):
+    if volume is None: return None
+    return (np.sign(close.diff()) * volume).fillna(0).cumsum()
 
 def parse_input(text):
     port = {}
@@ -200,13 +188,13 @@ def parse_input(text):
 
 # --- MAIN APP ---
 def main():
-    st.title("Alpha 5.0: 戰略地平線 (Strategic Horizon)")
-    st.caption("v5.0 | ±6個月趨勢 | 宏觀四維度 | 四角定位 | Kelly公式")
+    st.title("Alpha 5.1: 戰略地平線 Pro")
+    st.caption("v5.1 | ±6個月趨勢 | 資金流圖表 | 四角定位回測 | 質性說明書")
     st.markdown("---")
 
     with st.sidebar:
-        st.header("⚙️ 戰情設定")
-        fred_key = st.secrets.get("FRED_API_KEY", st.text_input("FRED API Key (宏觀數據用)", type="password"))
+        st.header("⚙️ 參數設定")
+        fred_key = st.secrets.get("FRED_API_KEY", st.text_input("FRED API Key", type="password"))
         
         st.header("💼 資產配置")
         default_input = """BTC-USD, 10000
@@ -217,50 +205,40 @@ PLTR, 5000"""
         portfolio_dict = parse_input(user_input)
         tickers_list = list(portfolio_dict.keys())
         total_value = sum(portfolio_dict.values())
-        st.metric("總資產估值 (Est.)", f"${total_value:,.0f}")
+        st.metric("總資產估值", f"${total_value:,.0f}")
         
         if st.button("🚀 啟動戰略掃描", type="primary"): st.session_state['run'] = True
 
-    if not st.session_state.get('run', False):
-        st.info("👈 請輸入資產並啟動。系統將執行 ±6 個月的深度戰略推演。")
-        return
+    if not st.session_state.get('run', False): return
 
     # --- 數據下載 ---
-    with st.spinner("🦅 正在建立宏觀與微觀連線..."):
+    with st.spinner("🦅 正在執行多維度戰略運算..."):
         df_close, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_macro = fetch_fred_macro(fred_key)
-        
-        # 準備個股基本面
         fund_data = {t: get_fundamental_anchor(t) for t in tickers_list}
 
     if df_close.empty: st.error("數據獲取失敗"); return
 
-    # --- PART 1: 宏觀戰略儀表 (Macro 4D) ---
-    st.subheader("1. 宏觀戰略儀表 (The Macro 4D)")
+    # --- PART 1: 宏觀戰略儀表 (Macro & Liquidity) ---
+    st.subheader("1. 宏觀戰略儀表 (Macro 4D)")
     
-    # 準備數據
-    tnx = df_close['^TNX'].iloc[-1] if '^TNX' in df_close else 4.0
-    vix = df_close['^VIX'].iloc[-1] if '^VIX' in df_close else 15.0
-    irx = df_close['^IRX'].iloc[-1] if '^IRX' in df_close else 5.0 # 短債近似利率
+    # 數據準備
+    vix = df_close['^VIX'].iloc[-1]
+    tnx = df_close['^TNX'].iloc[-1]
+    liq_val = df_macro['Net_Liquidity'].iloc[-1] if df_macro is not None else 0
     
-    # 如果有 FRED 數據，覆蓋流動性與利率
-    liq_val = "N/A"
-    fed_rate = irx # 預設用短債
-    if df_macro is not None and not df_macro.empty:
-        liq_val = f"${df_macro['Net_Liquidity'].iloc[-1]:.2f}T"
-        fed_rate = df_macro['RATE'].iloc[-1]
-
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("💧 全球流動性 (Fed)", liq_val, "總資金水位")
-    c2.metric("🌪️ 市場恐慌 (VIX)", f"{vix:.2f}", "避險成本", delta_color="inverse")
-    c3.metric("⚖️ 10年殖利率 (TNX)", f"{tnx:.2f}%", "資產定價錨")
-    c4.metric("🏦 Fed 基準利率", f"{fed_rate:.2f}%", "資金成本")
+    c1.metric("💧 全球流動性", f"${liq_val:.2f}T" if df_macro is not None else "N/A", "Fed 燃料")
+    c2.metric("🌪️ VIX 恐慌指數", f"{vix:.2f}", delta="避險成本", delta_color="inverse")
+    c3.metric("⚖️ 10年殖利率", f"{tnx:.2f}%", "無風險利率")
+    c4.metric("🏦 Fed 利率方向", "降息預期" if tnx < 4.5 else "高利率維持", "貨幣政策")
+
+    # [新增] 流動性圖表
+    if df_macro is not None:
+        fig_liq = px.line(df_macro, y='Net_Liquidity', title='聯準會淨流動性趨勢 (Net Liquidity)', color_discrete_sequence=['#00BFFF'])
+        fig_liq.update_layout(height=300, margin=dict(l=0,r=0,t=30,b=0))
+        st.plotly_chart(fig_liq, use_container_width=True)
     
-    # 宏觀判讀
-    macro_signal = "中性震盪"
-    if tnx < 4.0 and vix < 20: macro_signal = "🟢 Risk On (適合進攻)"
-    elif tnx > 4.5 or vix > 25: macro_signal = "🔴 Risk Off (防禦為上)"
-    st.caption(f"當前宏觀訊號：{macro_signal}")
     st.markdown("---")
 
     # --- PART 2: 個股戰略雷達 ---
@@ -270,101 +248,91 @@ PLTR, 5000"""
         if ticker not in df_close.columns: continue
         
         # 運算
-        trend = analyze_trend_6m(df_close[ticker])
-        f_data = fund_data.get(ticker, {})
-        t_atr, t_mc, t_fib, t_fund = calc_quad_targets(df_close[ticker], df_high[ticker], df_low[ticker], f_data)
-        kelly = calc_kelly_criterion(trend)
-        bt = backtest_lab(ticker, df_close[ticker], df_high[ticker], df_low[ticker])
+        trend = analyze_trend_matrix(df_close[ticker])
+        f_info = fund_data.get(ticker, {})
+        # 計算 1個月 (22天) 的目標價作為標準
+        t_atr, t_mc, t_fib, t_fund = calc_targets_v2(df_close[ticker], df_high[ticker], df_low[ticker], f_info, days_forecast=22)
+        kelly = calc_kelly(trend['status'])
+        bt = run_backtest(df_close[ticker], df_high[ticker], df_low[ticker], days_ago=22)
+        obv = calc_obv(df_close[ticker], df_vol[ticker])
         
-        # 顯示卡片
         with st.expander(f"🦅 {ticker} | {trend['status']} | Kelly: {kelly}", expanded=True):
             k1, k2, k3 = st.columns([2, 1, 1])
             
-            with k1: # 價格與預測
-                st.markdown("#### 🎯 四角定位 (Quad-Anchor)")
-                c_a, c_b = st.columns(2)
-                c_a.write(f"**1. 物理 (ATR):** ${t_atr:.2f}" if t_atr else "-")
-                c_a.write(f"**2. 統計 (MC):** ${t_mc:.2f}" if t_mc else "-")
-                c_b.write(f"**3. 心理 (Fib):** ${t_fib:.2f}" if t_fib else "-")
-                c_b.write(f"**4. 價值 (Wall St.):** ${t_fund}" if t_fund else "N/A")
-                
-                # 繪製 ±6個月 圖表
-                dates = df_close.index[-126:] # 過去6個月
+            with k1: # 圖表 (價格 + OBV)
+                st.markdown("#### 📉 價格與資金流 (Price & Fund Flow)")
                 fig = go.Figure()
+                # 主圖: 價格
+                dates = df_close.index[-126:] # 過去半年
                 fig.add_trace(go.Scatter(x=dates, y=df_close[ticker].iloc[-126:], name='Price', line=dict(color='#00FF7F', width=2)))
-                fig.add_trace(go.Scatter(x=dates, y=df_close[ticker].rolling(200).mean().iloc[-126:], name='SMA200 (牛熊線)', line=dict(color='orange', dash='dash')))
-                fig.update_layout(height=350, margin=dict(l=0,r=0,t=30,b=0), title=f"{ticker} 過去 6 個月走勢")
+                fig.add_trace(go.Scatter(x=dates, y=df_close[ticker].rolling(200).mean().iloc[-126:], name='SMA200', line=dict(color='gray', dash='dash')))
+                # 副圖: OBV
+                if obv is not None:
+                    fig.add_trace(go.Scatter(x=dates, y=obv.iloc[-126:], name='OBV (資金)', line=dict(color='#FFD700', width=1), yaxis='y2'))
+                
+                fig.update_layout(height=350, margin=dict(l=0,r=0,t=30,b=0),
+                                  yaxis2=dict(overlaying='y', side='right', showgrid=False, title='OBV'))
                 st.plotly_chart(fig, use_container_width=True)
 
-            with k2: # 未來推演
-                st.markdown("#### 🔮 未來 3 個月推演")
+            with k2: # 目標價矩陣
+                st.markdown("#### 🎯 四角定位 (1個月預測)")
+                st.write(f"**1. 物理 (ATR):** ${t_atr:.2f}" if t_atr else "-")
+                st.write(f"**2. 統計 (MC P50):** ${t_mc:.2f}" if t_mc else "-")
+                st.write(f"**3. 心理 (Fib 1.618):** ${t_fib:.2f}" if t_fib else "-")
+                st.write(f"**4. 價值 (DCF/PE):** ${t_fund}" if t_fund else "N/A")
+                
+                st.divider()
+                st.markdown("#### 🧪 回測驗證")
+                if bt:
+                    err = bt['ATR_Error']
+                    c_err = "green" if abs(err) < 0.05 else "red"
+                    st.markdown(f"ATR 模型誤差 (1M): <span style='color:{c_err}'>{err:.1%}</span>", unsafe_allow_html=True)
+                    st.caption(f"1月前預測 vs 今日現價")
+
+            with k3: # 未來推演
+                st.markdown("#### 🔮 未來趨勢推演")
                 st.metric("2週方向", f"${trend['p_2w']:.2f}")
                 st.metric("1月方向", f"${trend['p_1m']:.2f}")
                 st.metric("3月方向", f"${trend['p_3m']:.2f}")
-                st.caption("基於線性回歸通道")
-
-            with k3: # 估值與回測
-                st.markdown("#### ⚖️ 估值與驗證")
-                pe = f_data.get('Forward_PE')
-                st.metric("Forward P/E", f"{pe:.1f}" if pe else "N/A")
                 
-                if bt:
-                    st.markdown("#### 🧪 回測實驗室")
-                    err = bt['error']
-                    color = "green" if abs(err) < 0.05 else "red"
-                    st.markdown(f"1月前預測誤差: <span style='color:{color}'>{err:.1%}</span>", unsafe_allow_html=True)
-                    st.caption("模型: ATR極限法")
+                st.divider()
+                st.markdown("#### 💎 估值")
+                pe = f_info.get('Forward_PE')
+                st.metric("Forward P/E", f"{pe:.1f}" if pe else "N/A")
 
     st.markdown("---")
     
-    # --- PART 3: 資產總表 ---
-    st.subheader("3. 投資組合總表")
-    table_data = []
-    for ticker in tickers_list:
-        if ticker not in df_close.columns: continue
-        trend = analyze_trend_6m(df_close[ticker])
-        f_data = fund_data.get(ticker, {})
-        k_val = calc_kelly_criterion(trend)
-        
-        # 使用分析師目標價，若無則用 Monte Carlo
-        tgt = f_data.get('Target_Mean')
-        if not tgt: 
-            _, t_mc, _, _ = calc_quad_targets(df_close[ticker], df_high[ticker], df_low[ticker], f_data)
-            tgt = f"${t_mc:.2f} (MC)"
-        else:
-            tgt = f"${tgt} (Fund)"
-
-        table_data.append({
-            "代號": ticker,
-            "現價": f"${trend['p_now']:.2f}",
-            "趨勢狀態": trend['status'],
-            "目標價 (6M)": tgt,
-            "Kelly倉位": k_val,
-            "Forward P/E": f_data.get('Forward_PE', '-')
-        })
-    st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-
-    # --- PART 4: 公式白皮書 ---
-    st.markdown("---")
-    st.header("4. 量化模型公式手冊 (Quantitative Whitepaper)")
+    # --- PART 3: 質性說明書 (Qualitative Explanation) ---
+    st.header("3. 系統運作原理與質性說明 (System Logic)")
     
     with st.container():
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.info("### 🎯 四角定位 (Quad-Anchor)")
-            st.markdown("**1. 物理 (ATR):** $P + (ATR \\times \\sqrt{t} \\times 1.5)$")
-            st.markdown("**2. 統計 (MC):** 隨機漫步模擬中位數")
-            st.markdown("**3. 心理 (Fib):** $H + (H-L) \\times 0.618$")
-            st.markdown("**4. 價值 (DCF):** 華爾街共識目標價")
-        with c2:
-            st.info("### 🎲 凱利公式 (Half-Kelly)")
-            st.latex(r'''f^* = \frac{p(b+1)-1}{b} \times 0.5''')
-            st.markdown("* **p:** 勝率 (動態調整)")
-            st.markdown("* **b:** 賠率 (設為 2.0)")
-        with c3:
-            st.info("### 🔮 線性推演 (Linear Projection)")
-            st.latex(r'''y = \alpha + \beta x''')
-            st.markdown("基於過去 6 個月 ($N=126$) 的回歸斜率，推演未來 $t+10, t+22, t+66$ 的價格中樞。")
+        st.markdown('<div class="explanation-box">', unsafe_allow_html=True)
+        st.markdown("### 📊 各項數據的意義與運算邏輯")
+        
+        st.markdown("#### 1. 預測模型 (Prediction Models)")
+        st.info("""
+        * **🎯 保守目標 (ATR 物理極限):** 利用「平均真實波幅 (ATR)」計算股價在物理慣性下，未來一個月內「正常能量釋放」所能到達的極限邊界。這通常是波段操作的止盈點。
+        * **⚖️ 中樞目標 (蒙地卡羅 P50):** 電腦進行 1,000 次隨機漫步模擬 (Monte Carlo Simulation)，基於過去一年的波動率。取第 50 百分位數 (中位數)，代表統計學上「最可能發生」的落點。
+        * **🚀 樂觀目標 (費波那契 1.618):** 抓取過去一季 (60天) 的高低點，計算 1.618 黃金分割擴展位。這是群眾情緒瘋狂時，最容易產生共識的阻力位。
+        * **🏦 價值目標 (DCF/PE):** 採用華爾街分析師的平均目標價。這背後隱含了現金流折現 (DCF) 與遠期本益比 (Forward PE) 的專業估值。
+        """)
+        
+        st.divider()
+        
+        st.markdown("#### 2. 趨勢與資金 (Trend & Flow)")
+        st.info("""
+        * **OBV 資金流 (黃線):** 「能量潮指標」。當股價盤整但 OBV 創新高，代表主力正在吸籌 (Smart Money In)。反之則為出貨。圖表中採用雙軸顯示，方便對比價量背離。
+        * **線性推演 (2W/1M/3M):** 基於過去半年 (126個交易日) 的股價走勢，畫出一條最適合的線性回歸趨勢線，並向右延伸推算未來 2週、1個月、3個月 的理論價格。
+        * **Kelly 公式:** 根據趨勢多空動態調整勝率，計算出「數學上最佳」的持倉比例，以最大化長期幾何成長率並避免破產風險。
+        """)
+        
+        st.markdown("#### 3. 宏觀四維度 (Macro 4D)")
+        st.info("""
+        * **💧 淨流動性 (Net Liquidity):** Fed 資產負債表 - TGA - 逆回購。這是美股的「真實燃料」。水位上升有利風險資產。
+        * **⚖️ 10年殖利率 (TNX):** 全球資產定價的錨。殖利率過高會壓抑科技股估值 (P/E)。
+        """)
+        
+        st.markdown('</div>', unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
