@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 10.4: 宏觀全景版", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Alpha 10.5: 體質修復版", layout="wide", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -27,8 +27,7 @@ st.markdown("""
 # --- 1. 核心數據引擎 ---
 @st.cache_data(ttl=1800)
 def fetch_market_data(tickers):
-    # 加入 ^IRX (短債/利率方向), ^TNX (長債)
-    benchmarks = ['SPY', 'QQQ', 'QLD', 'TQQQ', '^VIX', '^TNX', '^IRX', 'HYG', 'GC=F', 'HG=F', 'DX-Y.NYB'] 
+    benchmarks = ['SPY', 'QQQ', 'QLD', 'TQQQ', '^VIX', '^TNX', 'HYG', 'GC=F', 'HG=F', 'DX-Y.NYB'] 
     all_tickers = list(set(tickers + benchmarks))
     data = {col: {} for col in ['Close', 'Open', 'High', 'Low', 'Volume']}
     
@@ -64,21 +63,27 @@ def fetch_fred_macro(api_key):
 @st.cache_data(ttl=3600*24)
 def get_advanced_info(ticker):
     try:
-        info = yf.Ticker(ticker).info
+        t = yf.Ticker(ticker)
+        info = t.info
+        
+        # 嘗試計算 Rule of 40
+        rev_g = info.get('revenueGrowth')
+        prof_m = info.get('profitMargins')
+        r40 = (rev_g + prof_m) * 100 if (rev_g is not None and prof_m is not None) else None
+
         return {
             'Target_Mean': info.get('targetMeanPrice'), 
             'Forward_PE': info.get('forwardPE'),
             'Trailing_PE': info.get('trailingPE'),
-            'PEG': info.get('pegRatio'),
+            'PEG': info.get('pegRatio'),  # 關鍵數據
             'Inst_Held': info.get('heldPercentInstitutions'),
             'Insider_Held': info.get('heldPercentInsiders'),
             'Short_Ratio': info.get('shortRatio'),
             'Current_Ratio': info.get('currentRatio'),
             'Debt_Equity': info.get('debtToEquity'),
-            'ROE': info.get('returnOnEquity'),
-            'Rev_Growth': info.get('revenueGrowth'),
-            'Profit_Margin': info.get('profitMargins'),
-            'Rule_40': (info.get('revenueGrowth',0) + info.get('profitMargins',0))*100 if info.get('revenueGrowth') else None
+            'ROE': info.get('returnOnEquity'), # 關鍵數據
+            'Profit_Margin': prof_m, # 新增備用
+            'Rule_40': r40
         }
     except: return {}
 
@@ -110,26 +115,22 @@ def calc_targets_composite(ticker, df_close, df_high, df_low, f_data, days_forec
     c = df_close[ticker]; h = df_high[ticker]; l = df_low[ticker]
     if len(c) < 100: return None
     
-    # ATR
     try:
         tr = pd.concat([h-l, (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
         atr = tr.rolling(14).mean().iloc[-1]
         t_atr = c.iloc[-1] + (atr * np.sqrt(days_forecast))
     except: t_atr = None
     
-    # MC
     try:
         mu = c.pct_change().mean()
         t_mc = c.iloc[-1] * ((1 + mu)**days_forecast)
     except: t_mc = None
     
-    # Fib
     try:
         recent = c.iloc[-60:]
         t_fib = recent.max() + (recent.max() - recent.min()) * 0.618 
     except: t_fib = None
     
-    # Fund & AI
     t_fund = f_data.get('Target_Mean')
     t_rf = train_rf_model(df_close, ticker, days_forecast)
     
@@ -185,7 +186,6 @@ def calc_obv(close, volume):
     if volume is None: return None
     return (np.sign(close.diff()) * volume).fillna(0).cumsum()
 
-# [Leverage Comparison]
 def compare_with_leverage(ticker, df_close):
     if ticker not in df_close.columns: return None
     benchs = ['QQQ', 'QLD', 'TQQQ']
@@ -244,11 +244,11 @@ def main():
         tickers_list = list(portfolio_dict.keys())
         total_value = sum(portfolio_dict.values())
         st.metric("總資產 (Est.)", f"${total_value:,.0f}")
-        if st.button("🚀 啟動宏觀全景", type="primary"): st.session_state['run'] = True
+        if st.button("🚀 啟動全能版", type="primary"): st.session_state['run'] = True
 
     if not st.session_state.get('run', False): return
 
-    with st.spinner("🦅 Alpha 10.4 正在建立宏觀連線..."):
+    with st.spinner("🦅 Alpha 10.5 正在執行深度掃描..."):
         df_close, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_macro = fetch_fred_macro(fred_key)
         adv_data = {t: get_advanced_info(t) for t in tickers_list}
@@ -259,25 +259,18 @@ def main():
 
     # === TAB 1: 戰略 ===
     with t1:
-        st.subheader("1. 宏觀戰情 (Macro Dashboard)")
-        
-        # 1. 數據準備
+        st.subheader("1. 宏觀與總表")
         liq = df_macro['Net_Liquidity'].iloc[-1] if df_macro is not None else 0
         vix = df_close['^VIX'].iloc[-1] if '^VIX' in df_close.columns else 0
         tnx = df_close['^TNX'].iloc[-1] if '^TNX' in df_close.columns else 0
-        irx = df_close['^IRX'].iloc[-1] if '^IRX' in df_close.columns else 0 # 13週短債 -> 利率方向
+        try: cg = (df_close['HG=F'].iloc[-1]/df_close['GC=F'].iloc[-1])*1000
+        except: cg = 0
         
-        # 2. 利率方向判讀
-        fed_status = "維持高利"
-        if irx > 5.2: fed_status = "🦅 升息壓力"
-        elif irx < 4.5: fed_status = "🕊️ 降息預期"
-        
-        # 3. 顯示儀表 (4 Columns)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("💧 淨流動性", f"${liq:.2f}T")
         c2.metric("🌪️ VIX", f"{vix:.2f}", delta_color="inverse")
         c3.metric("⚖️ 10年殖利率", f"{tnx:.2f}%")
-        c4.metric("🏦 利率方向", fed_status, f"短債 {irx:.2f}%")
+        c4.metric("🏭 銅金比", f"{cg:.2f}")
 
         if df_macro is not None: st.plotly_chart(px.line(df_macro, y='Net_Liquidity', title='聯準會流動性趨勢', height=250), use_container_width=True)
 
@@ -297,7 +290,7 @@ def main():
         st.dataframe(pd.DataFrame(summary), use_container_width=True)
         
         st.markdown("---")
-        st.subheader("2. 個股戰略雷達 (含槓桿挑戰)")
+        st.subheader("2. 個股戰略雷達")
         
         for t in tickers_list:
             if t not in df_close.columns: continue
@@ -306,18 +299,15 @@ def main():
             obv = calc_obv(df_close[t], df_vol[t])
             mvrv_s = calc_mvrv_z(df_close[t])
             mvrv = mvrv_s.iloc[-1] if mvrv_s is not None else 0
-            
             comp_res = compare_with_leverage(t, df_close)
-            comp_status = comp_res[1] if comp_res else "N/A"
             
             t_avg = f"${targets['Avg']:.2f}" if targets and targets['Avg'] else "-"
             
             with st.expander(f"🦅 {t} | MVRV: {mvrv:.2f} | 綜合: {t_avg}", expanded=False):
                 k1, k2, k3 = st.columns([2, 1, 1])
                 with k1:
-                    st.markdown("#### ⚔️ QQQ 挑戰賽")
                     if comp_res:
-                        st.caption(comp_status)
+                        st.markdown(f"**槓桿挑戰:** {comp_res[1]}")
                         st.plotly_chart(px.line(comp_res[0], title=f"{t} vs TQQQ").update_layout(height=300), use_container_width=True)
                     else: st.write("無數據")
 
@@ -341,15 +331,40 @@ def main():
                     fig.update_layout(height=300, margin=dict(l=0,r=0,t=30,b=0), yaxis2=dict(overlaying='y', side='right', showgrid=False))
                     st.plotly_chart(fig, use_container_width=True)
 
-    # === TAB 2~6 (保留) ===
+    # === TAB 2: 籌碼 ===
     with t2:
         st.subheader("🐋 籌碼")
         dat = [{"代號":t, "機構": f"{adv_data[t].get('Inst_Held',0)*100:.0f}%"} for t in tickers_list if t in df_close.columns]
         st.dataframe(pd.DataFrame(dat), use_container_width=True)
+
+    # === TAB 3: 體質 (Fix) ===
     with t3:
-        st.subheader("🔍 體質")
-        dat = [{"代號":t, "PEG": f"{adv_data[t].get('PEG',0)}", "ROE": f"{adv_data[t].get('ROE',0)*100:.1f}%" if adv_data[t].get('ROE') else "-"} for t in tickers_list if t in df_close.columns]
-        st.dataframe(pd.DataFrame(dat), use_container_width=True)
+        st.subheader("🔍 財務體質掃描 (Health Check)")
+        health_data = []
+        for t in tickers_list:
+            info = adv_data.get(t, {})
+            # 格式化檢查: 如果是 None 則顯示 "-"
+            peg = info.get('PEG')
+            peg_s = f"{peg:.2f}" if peg is not None else "-"
+            
+            roe = info.get('ROE')
+            roe_s = f"{roe*100:.1f}%" if roe is not None else "-"
+            
+            pm = info.get('Profit_Margin')
+            pm_s = f"{pm*100:.1f}%" if pm is not None else "-"
+            
+            health_data.append({
+                "代號": t,
+                "PEG (<1低估)": peg_s,
+                "ROE (權益報酬)": roe_s,
+                "淨利率 (Margin)": pm_s,
+                "流動比 (>1.5)": info.get('Current_Ratio'),
+                "負債/權益 (<1)": info.get('Debt_Equity')
+            })
+        st.dataframe(pd.DataFrame(health_data), use_container_width=True)
+        st.caption("💡 提示：ETF (如 TLT, QQQ) 或 虧損公司 通常無 PEG/ROE 數據，此為正常現象。")
+
+    # === TAB 4~6 (保留) ===
     with t4:
         st.subheader("🚦 回測")
         for t in tickers_list:
