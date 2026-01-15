@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 8.1: 戰略修復版", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Alpha 8.2: 核心修復版", layout="wide", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -21,20 +21,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. 核心數據引擎 (加入錯誤處理) ---
+# --- 1. 核心數據引擎 ---
 @st.cache_data(ttl=1800)
 def fetch_market_data(tickers):
-    # 移除可能導致錯誤的特殊符號，改用標準大盤
     benchmarks = ['SPY', 'QQQ', '^VIX', '^TNX', 'HYG', 'GC=F', 'HG=F', 'DX-Y.NYB'] 
     all_tickers = list(set(tickers + benchmarks))
     
     data = {col: {} for col in ['Close', 'Open', 'High', 'Low', 'Volume']}
-    progress_bar = st.progress(0, text="🦅 Alpha 8.1 正在建立連線...")
+    progress_bar = st.progress(0, text="🦅 Alpha 8.2 正在修復並建立連線...")
     
     for i, t in enumerate(all_tickers):
         try:
             progress_bar.progress((i + 1) / len(all_tickers), text=f"下載: {t} ...")
-            df = yf.Ticker(t).history(period="2y", auto_adjust=True) # 改回2年，減少數據負擔
+            df = yf.Ticker(t).history(period="2y", auto_adjust=True)
             if df.empty: continue
             
             data['Close'][t] = df['Close']
@@ -45,7 +44,6 @@ def fetch_market_data(tickers):
         except: continue
             
     progress_bar.empty()
-    # 確保有數據，否則回傳空 DataFrame
     try:
         return (pd.DataFrame(data['Close']).ffill(), 
                 pd.DataFrame(data['High']).ffill(), 
@@ -78,11 +76,9 @@ def get_fundamental_anchor(ticker):
         }
     except: return {}
 
-# --- 2. 機器學習引擎 (加入防呆) ---
-
+# --- 2. 機器學習引擎 ---
 def train_ai_model(target_ticker, df_close, df_vol, days_forecast=22):
     try:
-        # 數據檢查
         if target_ticker not in df_close.columns: return None
         
         df = pd.DataFrame(index=df_close.index)
@@ -91,74 +87,89 @@ def train_ai_model(target_ticker, df_close, df_vol, days_forecast=22):
         # 技術指標
         df['Vol'] = df['Close'].pct_change().rolling(20).std()
         
-        # 宏觀因子 (檢查是否存在)
+        # 宏觀因子
         if '^VIX' in df_close.columns: df['VIX'] = df_close['^VIX']
         if '^TNX' in df_close.columns: df['TNX'] = df_close['^TNX']
             
         df['Target'] = df['Close'].shift(-days_forecast)
         df = df.dropna()
         
-        if len(df) < 50: return None # 數據過少不訓練
+        if len(df) < 50: return None
         
         X = df.drop(columns=['Target', 'Close'])
         y = df['Target']
         
-        model = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42) # 輕量化模型
+        model = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
         model.fit(X, y)
         
         latest_features = X.iloc[[-1]]
         return model.predict(latest_features)[0]
     except: return None
 
-# --- 3. 核心運算 ---
+# --- 3. 核心運算 (修復版) ---
 
 def calc_kelly(trend_status, win_rate=0.55):
     if "Bull" in trend_status: win_rate += 0.1
     if "Bear" in trend_status: win_rate -= 0.15
-    f_star = (win_rate * 2.0 - 1) / 1.0 # 簡化版 Kelly
+    f_star = (win_rate * 2.0 - 1) / 1.0 
     return max(0, f_star * 0.5)
 
-def calc_targets_composite_v2(ticker, close, high, low, vol, f_data, days_forecast=22):
-    if len(close) < 100: return None # 降低門檻
+def calc_targets_composite_v2(ticker, df_close, df_high, df_low, df_vol, f_data, days_forecast=22):
+    """
+    FIXED: 確保所有輸入都是 Series (單一資產)，避免 DataFrame 維度錯誤
+    """
+    if ticker not in df_close.columns: return None
+    
+    # 強制提取單一資產數據
+    c = df_close[ticker]
+    h = df_high[ticker]
+    l = df_low[ticker]
+    
+    if len(c) < 100: return None 
     
     # ATR
     try:
-        tr = pd.concat([high-low, (high-close.shift(1)).abs(), (low-close.shift(1)).abs()], axis=1).max(axis=1)
+        prev_c = c.shift(1)
+        # 確保 concat 後只對 columns 做 max，結果為 Series
+        tr_df = pd.concat([h-l, (h-prev_c).abs(), (l-prev_c).abs()], axis=1)
+        tr = tr_df.max(axis=1)
         atr = tr.rolling(14).mean().iloc[-1]
-        t_atr = close.iloc[-1] + (atr * np.sqrt(days_forecast))
+        t_atr = c.iloc[-1] + (atr * np.sqrt(days_forecast))
     except: t_atr = None
     
     # MC
     try:
-        returns = close.pct_change().dropna()
-        mu, sigma = returns.mean(), returns.std()
-        sims = [close.iloc[-1] * ((1 + mu)**days_forecast) for _ in range(10)] # 極簡化模擬
-        t_mc = np.mean(sims)
+        returns = c.pct_change().dropna()
+        mu = returns.mean()
+        # 簡單幾何布朗運動期望值
+        t_mc = c.iloc[-1] * ((1 + mu)**days_forecast)
     except: t_mc = None
     
     # Fib
     try:
-        recent = close.iloc[-60:]
-        h, l = recent.max(), recent.min()
-        t_fib = h + (h - l) * 0.618 
+        recent = c.iloc[-60:]
+        high_p = recent.max()
+        low_p = recent.min()
+        t_fib = high_p + (high_p - low_p) * 0.618 
     except: t_fib = None
     
     # Fund
     t_fund = f_data.get('Target_Mean')
     
-    # AI
+    # AI (傳入完整 df_close 以獲取宏觀數據)
     try:
-        t_ai = train_ai_model(ticker, close.to_frame(ticker).join(close.to_frame('^VIX',), rsuffix='_vix'), vol, days_forecast)
+        t_ai = train_ai_model(ticker, df_close, df_vol, days_forecast)
     except: t_ai = None
     
-    # Avg
-    targets = [t for t in [t_atr, t_mc, t_fib, t_ai] if t is not None]
+    # Avg (過濾 None 與 NaN)
+    targets = [t for t in [t_atr, t_mc, t_fib, t_ai] if t is not None and not pd.isna(t)]
+    # 確保是純量運算
     t_avg = sum(targets) / len(targets) if targets else None
     
     return {"ATR": t_atr, "MC": t_mc, "Fib": t_fib, "Fund": t_fund, "AI": t_ai, "Avg": t_avg}
 
 def analyze_trend(series):
-    if series is None or len(series) < 60: return {"status": "資料不足", "p_now": 0, "p_2w": 0, "p_1m": 0, "p_3m": 0}
+    if series is None or len(series) < 60: return {"status": "資料不足", "p_now": 0, "p_1m": 0}
     
     p_now = series.iloc[-1]
     sma200 = series.rolling(200).mean().iloc[-1] if len(series) > 200 else series.rolling(50).mean().iloc[-1]
@@ -167,7 +178,6 @@ def analyze_trend(series):
     if p_now > sma200: status = "🔥 多頭"
     elif p_now < sma200 * 0.9: status = "🛑 空頭"
     
-    # 簡單線性預測
     try:
         y = series.values.reshape(-1, 1)
         x = np.arange(len(y)).reshape(-1, 1)
@@ -192,8 +202,8 @@ def parse_input(text):
 
 # --- MAIN APP ---
 def main():
-    st.title("Alpha 8.1: 戰略修復版 (Safe Mode)")
-    st.caption("v8.1 | 防呆機制 | AI 輕量化 | 確保運作")
+    st.title("Alpha 8.2: 戰略修復版 (Core Fix)")
+    st.caption("v8.2 | 數值維度修正 | 確保單一目標價 | AI 整合")
     st.markdown("---")
 
     with st.sidebar:
@@ -219,20 +229,17 @@ NVDA, 10000"""
         fund_data = {t: get_fundamental_anchor(t) for t in tickers_list}
 
     if df_close.empty: 
-        st.error("❌ 無法獲取市場數據。請檢查網路或資產代碼是否正確。")
+        st.error("❌ 無法獲取市場數據。請檢查代碼。")
         st.stop()
 
     # --- PART 1: 宏觀 ---
     st.subheader("1. 宏觀儀表 (Macro)")
     
-    # 安全獲取宏觀數據
     vix = df_close['^VIX'].iloc[-1] if '^VIX' in df_close.columns else 0
     tnx = df_close['^TNX'].iloc[-1] if '^TNX' in df_close.columns else 0
-    dxy = df_close['DX-Y.NYB'].iloc[-1] if 'DX-Y.NYB' in df_close.columns else 0
     
-    # 銅金比 (防呆)
-    try:
-        cg_ratio = (df_close['HG=F'].iloc[-1] / df_close['GC=F'].iloc[-1]) * 1000
+    # 銅金比
+    try: cg_ratio = (df_close['HG=F'].iloc[-1] / df_close['GC=F'].iloc[-1]) * 1000
     except: cg_ratio = 0
     
     liq_val = df_macro['Net_Liquidity'].iloc[-1] if df_macro is not None else 0
@@ -256,6 +263,7 @@ NVDA, 10000"""
         targets = calc_targets_composite_v2(ticker, df_close, df_high, df_low, df_vol, info)
         obv = calc_obv(df_close[ticker], df_vol[ticker])
         
+        # 安全顯示平均值
         t_avg_s = f"${targets['Avg']:.2f}" if targets and targets['Avg'] else "-"
         
         with st.expander(f"🦅 {ticker} | {trend['status']} | 綜合目標: {t_avg_s}", expanded=True):
