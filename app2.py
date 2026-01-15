@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 10.7: 穩定修復版", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Alpha 10.8: 精準區間版", layout="wide", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -65,19 +65,15 @@ def get_advanced_info(ticker):
     try:
         t = yf.Ticker(ticker)
         info = t.info
-        
-        # 1. 辨識資產類別
         q_type = info.get('quoteType', '').upper()
         is_etf = 'ETF' in q_type or 'MUTUALFUND' in q_type
         
-        # 2. 強韌化 PEG 計算
         peg = info.get('pegRatio')
         fwd_pe = info.get('forwardPE')
         earn_growth = info.get('earningsGrowth')
         if peg is None and fwd_pe is not None and earn_growth is not None and earn_growth > 0:
             peg = fwd_pe / (earn_growth * 100)
 
-        # 3. Rule of 40
         rev_g = info.get('revenueGrowth')
         pm = info.get('profitMargins')
         r40 = (rev_g + pm) * 100 if (rev_g is not None and pm is not None) else None
@@ -168,7 +164,13 @@ def run_backtest_lab(ticker, df_close, df_high, df_low, days_ago=22):
     valid_past = [x for x in [past_rf, past_atr, past_mc] if x is not None]
     if not valid_past: return None
     past_avg = sum(valid_past) / len(valid_past)
-    err = (past_avg - p_now) / p_now
+    err = (past_avg - p_now) / p_now # 正數代表預測比現價高 (高估)，負數代表預測比現價低 (低估)
+    # 通常我們看：預測 - 真實。
+    # 這裡調整為：(真實 - 預測) / 預測? 
+    # 這裡使用標準定義：Error = (Forecast - Actual) / Actual 
+    # 若 Forecast > Actual, Error > 0 (高估/看太好)
+    # 若 Forecast < Actual, Error < 0 (低估/看太壞)
+    
     return {"Past_Pred": past_avg, "Error": err}
 
 def calc_mvrv_z(series):
@@ -254,11 +256,11 @@ def main():
         tickers_list = list(portfolio_dict.keys())
         total_value = sum(portfolio_dict.values())
         st.metric("總資產 (Est.)", f"${total_value:,.0f}")
-        if st.button("🚀 啟動修復版", type="primary"): st.session_state['run'] = True
+        if st.button("🚀 啟動精準區間", type="primary"): st.session_state['run'] = True
 
     if not st.session_state.get('run', False): return
 
-    with st.spinner("🦅 Alpha 10.7 正在執行安全運算..."):
+    with st.spinner("🦅 Alpha 10.8 正在計算信心區間..."):
         df_close, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_macro = fetch_fred_macro(fred_key)
         adv_data = {t: get_advanced_info(t) for t in tickers_list}
@@ -284,20 +286,47 @@ def main():
 
         if df_macro is not None: st.plotly_chart(px.line(df_macro, y='Net_Liquidity', title='聯準會流動性趨勢', height=250), use_container_width=True)
 
-        st.markdown("#### 📊 持倉戰略總表")
+        st.markdown("#### 📊 持倉戰略總表 (95% 信心區間)")
         summary = []
         for t in tickers_list:
             if t not in df_close.columns: continue
+            
+            # 基本運算
             trend = analyze_trend_multi(df_close[t])
             mvrv = calc_mvrv_z(df_close[t])
             mvrv_val = mvrv.iloc[-1] if mvrv is not None else 0
+            
+            # 綜合預測與回測
             targets = calc_targets_composite(t, df_close, df_high, df_low, adv_data.get(t,{}), 22)
+            bt = run_backtest_lab(t, df_close, df_high, df_low, 22)
+            
+            # 信心區間計算 (2-Sigma)
+            # 假設常態分佈: 區間 = Target +/- 2 * (Price * Volatility * sqrt(22))
+            vol_daily = df_close[t].pct_change().std()
+            price_sigma = df_close[t].iloc[-1] * vol_daily * np.sqrt(22)
+            
+            tgt_val = targets['Avg'] if targets and targets['Avg'] else 0
+            
+            if tgt_val > 0:
+                range_low = tgt_val - 2 * price_sigma
+                range_high = tgt_val + 2 * price_sigma
+                range_str = f"${range_low:.0f} ~ ${range_high:.0f}"
+            else:
+                range_str = "-"
+            
+            bt_err = bt['Error'] if bt else 0
+            
             summary.append({
-                "代號": t, "現價": f"${trend['p_now']:.2f}", "狀態": trend['status'],
-                "MVRV (Z)": f"{mvrv_val:.2f}", "Kelly": f"{calc_kelly(trend['status'])*100:.0f}%",
-                "綜合預測": f"${targets['Avg']:.2f}" if targets and targets['Avg'] else "-"
+                "代號": t, 
+                "現價": f"${trend['p_now']:.2f}", 
+                "MVRV(Z)": f"{mvrv_val:.2f}", 
+                "Kelly": f"{calc_kelly(trend['status'])*100:.0f}%",
+                "綜合預測 (1M)": f"${tgt_val:.2f}",
+                "95% 預測區間": range_str,
+                "回測誤差 (Bias)": f"{bt_err:+.1%}"
             })
         st.dataframe(pd.DataFrame(summary), use_container_width=True)
+        st.caption("📝 誤差說明：正數 (+) 代表過去預測偏高 (高估)，負數 (-) 代表過去預測偏低 (低估)。")
         
         st.markdown("---")
         st.subheader("2. 個股戰略雷達")
@@ -341,18 +370,16 @@ def main():
                     fig.update_layout(height=300, margin=dict(l=0,r=0,t=30,b=0), yaxis2=dict(overlaying='y', side='right', showgrid=False))
                     st.plotly_chart(fig, use_container_width=True)
 
-    # === TAB 2: 籌碼 (FIXED) ===
+    # === TAB 2: 籌碼 ===
     with t2:
         st.subheader("🐋 籌碼與內部人")
         chip_data = []
         for t in tickers_list:
             if t not in df_close.columns: continue
             info = adv_data.get(t, {})
-            # 防呆處理
             inst = info.get('Inst_Held')
             insider = info.get('Insider_Held')
             short = info.get('Short_Ratio')
-            
             chip_data.append({
                 "代號": t,
                 "機構持股": f"{inst*100:.1f}%" if inst is not None else "-",
@@ -361,23 +388,16 @@ def main():
             })
         st.dataframe(pd.DataFrame(chip_data), use_container_width=True)
 
-    # === TAB 3: 體質 (Fix) ===
+    # === TAB 3: 體質 ===
     with t3:
         st.subheader("🔍 財務體質掃描")
         health_data = []
         for t in tickers_list:
-            if t not in df_close.columns: continue
             info = adv_data.get(t, {})
             is_etf = info.get('Type') == 'ETF'
-            
-            peg = info.get('PEG')
-            peg_s = "ETF" if is_etf else (f"{peg:.2f}" if peg is not None else "-")
-            
-            roe = info.get('ROE')
-            roe_s = "ETF" if is_etf else (f"{roe*100:.1f}%" if roe is not None else "-")
-            
-            pm = info.get('Profit_Margin')
-            pm_s = "ETF" if is_etf else (f"{pm*100:.1f}%" if pm is not None else "-")
+            peg = info.get('PEG'); peg_s = "ETF" if is_etf else (f"{peg:.2f}" if peg is not None else "-")
+            roe = info.get('ROE'); roe_s = "ETF" if is_etf else (f"{roe*100:.1f}%" if roe is not None else "-")
+            pm = info.get('Profit_Margin'); pm_s = "ETF" if is_etf else (f"{pm*100:.1f}%" if pm is not None else "-")
             
             health_data.append({
                 "代號": t, "PEG": peg_s, "ROE": roe_s, "淨利率": pm_s,
