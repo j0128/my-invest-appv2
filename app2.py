@@ -4,12 +4,14 @@ import pandas as pd
 import yfinance as yf
 from fredapi import Fred
 from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 7.0: 全域資金流戰略", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Alpha 8.0: 機器學習戰略", layout="wide", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -21,21 +23,21 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. 核心數據引擎 (Data Engine) ---
+# --- 1. 核心數據引擎 ---
 @st.cache_data(ttl=1800)
 def fetch_market_data(tickers):
-    # 強制加入宏觀基準: SPY(大盤), QQQ(科技), VIX(恐慌), TNX(長債), IRX(短債/Fed預期)
-    benchmarks = ['SPY', 'QQQ', '^VIX', '^TNX', '^IRX', 'HYG'] 
+    # 加入宏觀因子: 銅(HG=F), 黃金(GC=F), 油(CL=F), 美元(DX-Y.NYB)
+    benchmarks = ['SPY', 'QQQ', '^VIX', '^TNX', '^IRX', 'HYG', 'HG=F', 'GC=F', 'CL=F', 'DX-Y.NYB'] 
     all_tickers = list(set(tickers + benchmarks))
     
     data = {col: {} for col in ['Close', 'Open', 'High', 'Low', 'Volume']}
-    progress_bar = st.progress(0, text="🦅 Alpha 7.0 正在掃描全域資金流...")
+    progress_bar = st.progress(0, text="🦅 Alpha 8.0 正在訓練 AI 模型...")
     
     for i, t in enumerate(all_tickers):
         try:
-            progress_bar.progress((i + 1) / len(all_tickers), text=f"下載: {t} ...")
-            # 抓取 2 年數據以計算長期 RRG 與 MVRV
-            df = yf.Ticker(t).history(period="2y", auto_adjust=True)
+            progress_bar.progress((i + 1) / len(all_tickers), text=f"下載與特徵工程: {t} ...")
+            # 抓取 3 年數據以供機器學習訓練
+            df = yf.Ticker(t).history(period="3y", auto_adjust=True)
             if df.empty: continue
             data['Close'][t] = df['Close']
             data['Open'][t] = df['Open']
@@ -52,150 +54,138 @@ def fetch_fred_macro(api_key):
     if not api_key: return None
     try:
         fred = Fred(api_key=api_key)
-        # 流動性公式: WALCL (Fed資產) - TGA (財政部帳戶) - RRP (逆回購)
-        walcl = fred.get_series('WALCL', observation_start='2024-01-01')
-        tga = fred.get_series('WTREGEN', observation_start='2024-01-01')
-        rrp = fred.get_series('RRPONTSYD', observation_start='2024-01-01')
+        walcl = fred.get_series('WALCL', observation_start='2023-01-01')
+        tga = fred.get_series('WTREGEN', observation_start='2023-01-01')
+        rrp = fred.get_series('RRPONTSYD', observation_start='2023-01-01')
         df = pd.DataFrame({'WALCL': walcl, 'TGA': tga, 'RRP': rrp}).ffill().dropna()
-        df['Net_Liquidity'] = (df['WALCL'] - df['TGA'] - df['RRP']) / 1000 # 兆
+        df['Net_Liquidity'] = (df['WALCL'] - df['TGA'] - df['RRP']) / 1000 
         return df
     except: return None
 
 @st.cache_data(ttl=3600*24)
-def get_advanced_metrics(ticker):
-    """抓取基本面與機構數據"""
+def get_fundamental_anchor(ticker):
     try:
         info = yf.Ticker(ticker).info
-        # Rule of 40 計算
-        rev_g = info.get('revenueGrowth', 0)
-        prof_m = info.get('profitMargins', 0)
-        r40 = (rev_g + prof_m) * 100 if rev_g and prof_m else None
-        
         return {
-            'Target_Mean': info.get('targetMeanPrice'), # 華爾街共識
+            'Target_Mean': info.get('targetMeanPrice'), 
             'Forward_PE': info.get('forwardPE'),
-            'Inst_Held': info.get('heldPercentInstitutions'), # 機構持股
-            'Rule_40': r40,
-            'PEG': info.get('pegRatio')
+            'Trailing_PE': info.get('trailingPE')
         }
     except: return {}
 
-# --- 2. 核心運算模型 ---
+# --- 2. 機器學習引擎 (AI Engine) ---
 
-# A. RRG 資金流向 (取代 Excel)
-def calc_rrg(df_close, tickers, benchmark='SPY'):
-    if benchmark not in df_close.columns: return pd.DataFrame()
-    rrg_data = []
-    bench = df_close[benchmark]
-    
-    for t in tickers:
-        if t not in df_close.columns or t == benchmark: continue
-        # 1. 相對強度 (RS)
-        rs = df_close[t] / bench
-        # 2. RS-Ratio (趨勢): 短期RS / 長期RS
-        rs_mean_short = rs.rolling(10).mean()
-        rs_mean_long = rs.rolling(60).mean()
-        if len(rs_mean_short.dropna()) < 60: continue
-        
-        rs_ratio = (rs_mean_short / rs_mean_long * 100).iloc[-1]
-        
-        # 3. RS-Momentum (動能): Ratio 的變化率
-        rs_ratio_series = rs_mean_short / rs_mean_long * 100
-        rs_mom = ((rs_ratio_series.iloc[-1] - rs_ratio_series.iloc[-10]) * 5) + 100
-        
-        # 4. 象限
-        if rs_ratio > 100 and rs_mom > 100: q = "🟢 領先 (Leading)"
-        elif rs_ratio > 100 and rs_mom < 100: q = "🟡 轉弱 (Weakening)"
-        elif rs_ratio < 100 and rs_mom < 100: q = "🔴 落後 (Lagging)"
-        else: q = "🔵 改善 (Improving)"
-        
-        rrg_data.append({'Ticker': t, 'RS_Ratio': rs_ratio, 'RS_Momentum': rs_mom, 'Quadrant': q})
-    return pd.DataFrame(rrg_data)
-
-# B. MVRV Z-Score (估值偏離度)
-def calc_mvrv_z(series):
+def train_ai_model(target_ticker, df_close, df_vol, days_forecast=22):
+    """
+    訓練隨機森林 (Random Forest) 預測 1 個月後的價格
+    特徵: RSI, 波動率, 均線乖離, 宏觀因子(VIX, 殖利率, 銅金比)
+    """
     try:
-        sma200 = series.rolling(200).mean()
-        std200 = series.rolling(200).std()
-        z = (series - sma200) / std200
-        return z
+        # 1. 準備特徵 (Features)
+        df = pd.DataFrame(index=df_close.index)
+        df['Close'] = df_close[target_ticker]
+        
+        # 技術指標
+        df['RSI'] = 100 - (100 / (1 + df['Close'].diff().apply(lambda x: x if x>0 else 0).rolling(14).mean() / df['Close'].diff().apply(lambda x: -x if x<0 else 0).rolling(14).mean()))
+        df['SMA_50'] = df['Close'] / df['Close'].rolling(50).mean() - 1 # 乖離率
+        df['Vol_20'] = df['Close'].pct_change().rolling(20).std()
+        
+        # 宏觀因子 (如果有的話)
+        if '^VIX' in df_close.columns: df['VIX'] = df_close['^VIX']
+        if '^TNX' in df_close.columns: df['TNX'] = df_close['^TNX']
+        if 'HG=F' in df_close.columns and 'GC=F' in df_close.columns:
+            df['Copper_Gold'] = df_close['HG=F'] / df_close['GC=F']
+            
+        # 2. 準備標籤 (Target): 未來 N 天的收益率
+        df['Target'] = df['Close'].shift(-days_forecast) # 未來價格
+        
+        # 清洗數據
+        df = df.dropna()
+        if len(df) < 100: return None # 數據太少不訓練
+        
+        # 3. 訓練模型
+        X = df.drop(columns=['Target', 'Close']) # 使用所有特徵
+        y = df['Target']
+        
+        # 分割訓練集與測試集 (不使用未來數據訓練)
+        split = int(len(df) * 0.9)
+        X_train, y_train = X.iloc[:split], y.iloc[:split]
+        
+        model = RandomForestRegressor(n_estimators=100, max_depth=10, random_state=42)
+        model.fit(X_train, y_train)
+        
+        # 4. 預測最新一筆
+        latest_features = X.iloc[[-1]]
+        pred_price = model.predict(latest_features)[0]
+        
+        return pred_price
     except: return None
 
-# C. 四角定位 (v3 精準版) + 平均
-def calc_targets_composite(close, high, low, f_data, days_forecast=22):
-    if len(close) < 252: return None
-    
-    # 1. ATR (趨勢調整版)
-    tr = pd.concat([high-low, (high-close.shift(1)).abs(), (low-close.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().iloc[-1]
-    
-    # 線性預測未來均價
-    y = close.iloc[-126:].values.reshape(-1, 1)
+# --- 3. 核心運算 (綜合模型 v2) ---
+
+def calc_kelly(trend_status, win_rate=0.55, odds=2.0):
+    if "Bull" in trend_status: win_rate += 0.1
+    if "Bear" in trend_status: win_rate -= 0.15
+    f_star = (win_rate * (odds + 1) - 1) / odds
+    return max(0, f_star * 0.5)
+
+def calc_trend_projection(series, days_future):
+    y = series.values.reshape(-1, 1)
     x = np.arange(len(y)).reshape(-1, 1)
     model = LinearRegression().fit(x, y)
-    price_projected = model.predict([[len(y) + days_forecast]])[0].item()
+    return model.predict([[len(y) + days_future]])[0].item()
+
+def calc_targets_composite_v2(ticker, close, high, low, vol, f_data, days_forecast=22):
+    if len(close) < 252: return None
+    
+    # 1. ATR (物理 - 趨勢調整)
+    tr = pd.concat([high-low, (high-close.shift(1)).abs(), (low-close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().iloc[-1]
+    price_projected = calc_trend_projection(close.iloc[-126:], days_forecast) 
     t_atr = price_projected + (atr * np.sqrt(days_forecast))
     
-    # 2. Monte Carlo (P50)
+    # 2. Monte Carlo (機率 - P50)
     returns = close.iloc[-252:].pct_change().dropna()
     mu, sigma = returns.mean(), returns.std()
     sims = []
-    for _ in range(500):
+    for _ in range(1000):
         p = close.iloc[-1]
         for _ in range(days_forecast): p *= (1 + np.random.normal(mu, sigma))
         sims.append(p)
     t_mc = np.percentile(sims, 50)
     
-    # 3. Fibonacci
+    # 3. Fibonacci (心理)
     recent = close.iloc[-60:]
     h, l = recent.max(), recent.min()
-    t_fib = h + (h - l) * 0.618
+    t_fib = h + (h - l) * 0.618 
     
-    # 4. Fundamental
+    # 4. Fundamental (價值)
     t_fund = f_data.get('Target_Mean')
     
-    # 綜合平均 (僅技術面)
-    tech_avg = (t_atr + t_mc + t_fib) / 3
+    # 5. AI Prediction (機器學習) - NEW!
+    t_ai = train_ai_model(ticker, close.to_frame(ticker).join(close.to_frame('^VIX'), rsuffix='_vix'), vol, days_forecast)
     
-    return {"ATR": t_atr, "MC": t_mc, "Fib": t_fib, "Fund": t_fund, "Avg": tech_avg}
+    # 綜合平均 (包含 AI)
+    targets_list = [t for t in [t_atr, t_mc, t_fib, t_ai] if t is not None]
+    t_avg = sum(targets_list) / len(targets_list) if targets_list else None
+    
+    return {
+        "ATR": t_atr, "MC": t_mc, "Fib": t_fib, "Fund": t_fund, "AI": t_ai, "Avg": t_avg
+    }
 
-# D. 全模組回測
 def run_backtest_composite(close, high, low, days_ago=22):
     if len(close) < 300: return None
     idx_past = len(close) - days_ago - 1
     p_now = close.iloc[-1]
     
-    # 切片數據
+    # 簡化回測: 比較 ATR 與 趨勢線 的準確度作為代表
     c_slice = close.iloc[:idx_past+1]
-    h_slice = high.iloc[:idx_past+1]
-    l_slice = low.iloc[:idx_past+1]
-    
-    # 重跑模型 (當時視角)
-    # ATR
-    tr = pd.concat([h_slice-l_slice], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().iloc[-1]
     y = c_slice.iloc[-126:].values.reshape(-1, 1)
     model = LinearRegression().fit(np.arange(len(y)).reshape(-1, 1), y)
-    pred_trend = model.predict([[len(y) + days_ago]])[0].item()
-    past_atr = pred_trend + (atr * np.sqrt(days_ago))
+    pred = model.predict([[len(y) + days_ago]])[0].item()
+    err = (pred - p_now) / p_now
     
-    # Fib
-    recent = c_slice.iloc[-60:]
-    past_fib = recent.max() + (recent.max() - recent.min()) * 0.618
-    
-    # MC (簡化)
-    past_mc = c_slice.iloc[-1] * (1 + c_slice.pct_change().mean() * days_ago)
-    
-    past_avg = (past_atr + past_fib + past_mc) / 3
-    err = (past_avg - p_now) / p_now
-    
-    return {"Past_Avg": past_avg, "Error": err, "Price_Now": p_now}
-
-def calc_kelly(trend_status, win_rate=0.55):
-    if "Bull" in trend_status: win_rate += 0.1
-    if "Bear" in trend_status: win_rate -= 0.15
-    f_star = (win_rate * 3 - 1) / 2 # Odds約為2
-    return max(0, f_star * 0.5)
+    return {"Past_Pred": pred, "Error": err, "Price_Now": p_now}
 
 def analyze_trend_matrix(series):
     if len(series) < 126: return None
@@ -231,8 +221,8 @@ def parse_input(text):
 
 # --- MAIN APP ---
 def main():
-    st.title("Alpha 7.0: 全域資金流戰略 (Omni-Flow)")
-    st.caption("v7.0 | RRG 資金流 | MVRV 估值 | 宏觀利率 | 四角回測")
+    st.title("Alpha 8.0: 機器學習戰略 (ML Enhanced)")
+    st.caption("v8.0 | AI 隨機森林預測 | 宏觀因子 | 銅金比 | 綜合回測")
     st.markdown("---")
 
     with st.sidebar:
@@ -249,140 +239,109 @@ PLTR, 5000"""
         tickers_list = list(portfolio_dict.keys())
         total_value = sum(portfolio_dict.values())
         st.metric("總資產", f"${total_value:,.0f}")
-        if st.button("🚀 啟動全域掃描", type="primary"): st.session_state['run'] = True
+        if st.button("🚀 啟動 AI 運算", type="primary"): st.session_state['run'] = True
 
     if not st.session_state.get('run', False): return
 
-    with st.spinner("🦅 Alpha 7.0 正在連線華爾街資料庫..."):
+    with st.spinner("🦅 正在訓練 AI 模型與下載宏觀數據..."):
         df_close, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_macro = fetch_fred_macro(fred_key)
-        adv_data = {t: get_advanced_metrics(t) for t in tickers_list}
+        fund_data = {t: get_fundamental_anchor(t) for t in tickers_list}
 
     if df_close.empty: st.error("No Data"); return
 
-    # --- PART 1: 宏觀與資金流 (Macro & RRG) ---
-    st.subheader("1. 宏觀與資金流向 (Macro & Fund Flow)")
+    # --- PART 1: 宏觀與經濟 (Macro & Economy) ---
+    st.subheader("1. 宏觀經濟晴雨表 (Macro Dashboard)")
     
     # 宏觀指標
     vix = df_close['^VIX'].iloc[-1]
     tnx = df_close['^TNX'].iloc[-1]
-    irx = df_close['^IRX'].iloc[-1] # 13週短債，作為 Fed 利率預期代理
+    dxy = df_close['DX-Y.NYB'].iloc[-1] if 'DX-Y.NYB' in df_close else 0
+    # 銅金比 (Copper/Gold) - 經濟領先指標
+    cg_ratio = (df_close['HG=F'].iloc[-1] / df_close['GC=F'].iloc[-1]) * 1000 if 'HG=F' in df_close and 'GC=F' in df_close else 0
+    
     liq_val = df_macro['Net_Liquidity'].iloc[-1] if df_macro is not None else 0
     
-    # 判斷 Fed 方向
-    fed_trend = "維持高利"
-    if irx < 4.5: fed_trend = "📉 降息預期 (Dovish)"
-    elif irx > 5.0: fed_trend = "📈 升息壓力 (Hawkish)"
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("💧 淨流動性", f"${liq_val:.2f}T")
+    c2.metric("🌪️ VIX", f"{vix:.2f}", delta_color="inverse")
+    c3.metric("⚖️ 10年殖利率", f"{tnx:.2f}%")
+    c4.metric("🏭 銅金比 (經濟)", f"{cg_ratio:.2f}", "數值高=景氣好")
+    c5.metric("💵 美元指數", f"{dxy:.2f}")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("💧 美元淨流動性", f"${liq_val:.2f}T" if df_macro is not None else "N/A")
-    c2.metric("🌪️ VIX 恐慌指數", f"{vix:.2f}", delta="避險成本", delta_color="inverse")
-    c3.metric("⚖️ 10年殖利率", f"{tnx:.2f}%", "定價錨")
-    c4.metric("🏦 Fed 利率方向", fed_trend, f"短債: {irx:.2f}%")
-
-    # RRG 圖表
-    rrg_df = calc_rrg(df_close, tickers_list)
-    if not rrg_df.empty:
-        fig_rrg = px.scatter(rrg_df, x='RS_Ratio', y='RS_Momentum', color='Quadrant', text='Ticker',
-                             title="RRG 資金流向雷達 (vs SPY)",
-                             color_discrete_map={'🟢 領先 (Leading)': '#00FF7F', '🟡 轉弱 (Weakening)': '#FFFF00',
-                                                 '🔴 落後 (Lagging)': '#FF4B4B', '🔵 改善 (Improving)': '#00BFFF'})
-        fig_rrg.add_vline(x=100, line_dash="dash", line_color="gray")
-        fig_rrg.add_hline(y=100, line_dash="dash", line_color="gray")
-        fig_rrg.update_layout(xaxis_title="RS-Ratio (趨勢強度)", yaxis_title="RS-Momentum (動能速度)", height=500)
-        st.plotly_chart(fig_rrg, use_container_width=True)
-    
+    if df_macro is not None:
+        fig_liq = px.line(df_macro, y='Net_Liquidity', title='聯準會淨流動性趨勢', color_discrete_sequence=['#00BFFF'])
+        fig_liq.update_layout(height=300, margin=dict(l=0,r=0,t=30,b=0))
+        st.plotly_chart(fig_liq, use_container_width=True)
     st.markdown("---")
 
-    # --- PART 2: 個股全域分析 ---
-    st.subheader("2. 個股全域分析 (Deep Dive)")
+    # --- PART 2: 個股 AI 戰略 ---
+    st.subheader("2. 個股 AI 戰略 (AI Strategic Radar)")
     
     for ticker in tickers_list:
         if ticker not in df_close.columns: continue
         
         trend = analyze_trend_matrix(df_close[ticker])
-        info = adv_data.get(ticker, {})
-        targets = calc_targets_composite(df_close[ticker], df_high[ticker], df_low[ticker], info, days_forecast=22)
+        f_info = fund_data.get(ticker, {})
+        # 計算 1個月 的目標價 (五角定位: ATR, MC, Fib, Fund, AI)
+        targets = calc_targets_composite_v2(ticker, df_close, df_high, df_low, df_vol, f_info, days_forecast=22)
         kelly = calc_kelly(trend['status'])
         bt = run_backtest_composite(df_close[ticker], df_high[ticker], df_low[ticker], days_ago=22)
         obv = calc_obv(df_close[ticker], df_vol[ticker])
-        mvrv_series = calc_mvrv_z(df_close[ticker])
-        mvrv_now = mvrv_series.iloc[-1] if mvrv_series is not None else 0
         
-        # 標題
         t_avg_s = f"${targets['Avg']:.2f}" if targets and targets['Avg'] else "-"
         
         with st.expander(f"🦅 {ticker} | {trend['status']} | 綜合目標: {t_avg_s}", expanded=True):
             k1, k2, k3 = st.columns([2, 1, 1])
             
-            with k1: # 圖表 (價格+OBV)
-                st.markdown("#### 📉 價格與資金流 (Price & OBV)")
+            with k1: # 圖表
+                st.markdown("#### 📉 雙軸圖 (Price & OBV)")
                 fig = go.Figure()
                 dates = df_close.index[-126:]
                 fig.add_trace(go.Scatter(x=dates, y=df_close[ticker].iloc[-126:], name='Price', line=dict(color='#00FF7F', width=2)))
                 fig.add_trace(go.Scatter(x=dates, y=df_close[ticker].rolling(200).mean().iloc[-126:], name='SMA200', line=dict(color='gray', dash='dash')))
                 if obv is not None:
                     fig.add_trace(go.Scatter(x=dates, y=obv.iloc[-126:], name='OBV', line=dict(color='#FFD700', width=1), yaxis='y2'))
-                fig.update_layout(height=350, margin=dict(l=0,r=0,t=30,b=0), yaxis2=dict(overlaying='y', side='right', showgrid=False, title='OBV'))
+                fig.update_layout(height=350, margin=dict(l=0,r=0,t=30,b=0), yaxis2=dict(overlaying='y', side='right', showgrid=False, title='OBV'), legend=dict(orientation="h"))
                 st.plotly_chart(fig, use_container_width=True)
 
-            with k2: # 預測與回測
-                st.markdown("#### 🎯 四角定位 (1M)")
+            with k2: # AI 預測矩陣
+                st.markdown("#### 🤖 五角定位 (1M)")
                 if targets:
                     st.write(f"**1. 物理 (ATR):** ${targets['ATR']:.2f}")
                     st.write(f"**2. 統計 (MC):** ${targets['MC']:.2f}")
                     st.write(f"**3. 心理 (Fib):** ${targets['Fib']:.2f}")
-                    st.write(f"**4. 價值 (DCF):** ${targets['Fund']}" if targets['Fund'] else "N/A")
+                    st.write(f"**4. 智能 (AI):** ${targets['AI']:.2f}" if targets['AI'] else "N/A")
+                    st.caption("AI 模型: Random Forest Regressor")
+                    st.write(f"**5. 價值 (DCF):** ${targets['Fund']}" if targets['Fund'] else "N/A")
                 
                 st.divider()
-                st.markdown("#### 🧪 平均模型回測")
                 if bt:
                     err = bt['Error']
                     c_err = "green" if abs(err) < 0.05 else "red"
-                    st.markdown(f"1月前預測誤差: <span style='color:{c_err}'>{err:.1%}</span>", unsafe_allow_html=True)
-                    st.caption(f"當時預測 ${bt['Past_Avg']:.2f} vs 今日 ${bt['Price_Now']:.2f}")
+                    st.markdown(f"回測誤差: <span style='color:{c_err}'>{err:.1%}</span>", unsafe_allow_html=True)
 
-            with k3: # 戰略指標 (MVRV, Rule40, Kelly)
-                st.markdown("#### 💎 戰略指標")
-                # MVRV Z-Score Gauge
-                z_col = "red" if mvrv_now > 2 else ("green" if mvrv_now < 0 else "orange")
-                st.metric("MVRV Z-Score", f"{mvrv_now:.2f}", delta="過熱" if mvrv_now>2 else ("超賣" if mvrv_now<0 else "正常"), delta_color="inverse")
-                
-                # Rule of 40
-                r40 = info.get('Rule_40')
-                st.metric("Rule of 40", f"{r40:.1f}" if r40 else "-", delta="優質" if r40 and r40>40 else "普通")
-                
-                # 機構持股
-                inst = info.get('Inst_Held')
-                st.metric("機構持股比", f"{inst*100:.0f}%" if inst else "-")
+            with k3: # 未來推演
+                st.markdown("#### 🔮 趨勢推演")
+                st.metric("2週方向", f"${trend['p_2w']:.2f}")
+                st.metric("1月方向", f"${trend['p_1m']:.2f}")
+                st.metric("3月方向", f"${trend['p_3m']:.2f}")
                 
                 st.divider()
-                st.metric("Kelly 建議倉位", f"{kelly*100:.1f}%")
+                st.metric("Forward P/E", f"{f_info.get('Forward_PE')}")
 
     st.markdown("---")
     
-    # --- PART 3: 質性說明書 ---
+    # --- PART 3: 說明書 ---
     st.header("3. 系統運作原理與質性說明")
     with st.container():
         st.markdown('<div class="explanation-box">', unsafe_allow_html=True)
-        
-        st.markdown("### 🌊 RRG 資金流向 (Relative Rotation Graph)")
-        st.info("透過比較每一檔資產相對於 **SPY (大盤)** 的強度與動能，將資金流向可視化。\n* **🟢 領先 (Leading):** 趨勢強、動能強 (資金流入)。\n* **🔴 落後 (Lagging):** 趨勢弱、動能弱 (資金流出)。")
-        
-
-        st.divider()
-        st.markdown("### 📉 MVRV Z-Score (估值偏離)")
-        st.info("計算價格與 200日均線 的標準差距離。這是一個均值回歸指標。\n* **Z > 2.0:** 價格嚴重偏離，風險極高 (紅色)。\n* **Z < 0.0:** 價格低於長期均線，潛在低估 (綠色)。")
+        st.markdown("### 🤖 機器學習 (Random Forest)")
+        st.info("系統現場訓練一個 **隨機森林模型**，學習該資產過去 3 年的價格行為、波動率、RSI 以及宏觀因子 (VIX, 殖利率) 之間的非線性關係，並預測 1 個月後的價格。這是比線性回歸更先進的預測方法。")
         
         st.divider()
-        st.markdown("### 🎯 四角定位與回測")
-        st.markdown("""
-        * **物理 (ATR Trend):** 考慮趨勢斜率與波動率的極限價格。
-        * **統計 (Monte Carlo):** 1000次隨機漫步的中位數。
-        * **心理 (Fibonacci):** 1.618 黃金擴展位。
-        * **價值 (Fundamental):** 華爾街 DCF/PE 共識。
-        * **回測 (Backtest):** 系統自動回溯至 22 天前，重跑模型並計算當時預測值與今日現價的誤差。
-        """)
+        st.markdown("### 🏭 銅金比 (Copper/Gold Ratio)")
+        st.info("銅代表工業需求 (實體經濟)，黃金代表避險需求 (恐慌)。\n* **銅金比上升:** 經濟復甦，有利股市 (Risk On)。\n* **銅金比下降:** 經濟衰退，資金轉向避險 (Risk Off)。")
         
         st.markdown('</div>', unsafe_allow_html=True)
 
