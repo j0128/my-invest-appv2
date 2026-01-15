@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 10.3: 槓桿挑戰版", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Alpha 10.4: 宏觀全景版", layout="wide", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -27,8 +27,8 @@ st.markdown("""
 # --- 1. 核心數據引擎 ---
 @st.cache_data(ttl=1800)
 def fetch_market_data(tickers):
-    # 強制加入 QQQ 家族作為基準
-    benchmarks = ['SPY', 'QQQ', 'QLD', 'TQQQ', '^VIX', '^TNX', 'HYG', 'GC=F', 'HG=F', 'DX-Y.NYB'] 
+    # 加入 ^IRX (短債/利率方向), ^TNX (長債)
+    benchmarks = ['SPY', 'QQQ', 'QLD', 'TQQQ', '^VIX', '^TNX', '^IRX', 'HYG', 'GC=F', 'HG=F', 'DX-Y.NYB'] 
     all_tickers = list(set(tickers + benchmarks))
     data = {col: {} for col in ['Close', 'Open', 'High', 'Low', 'Volume']}
     
@@ -185,28 +185,19 @@ def calc_obv(close, volume):
     if volume is None: return None
     return (np.sign(close.diff()) * volume).fillna(0).cumsum()
 
-# [NEW] 槓桿挑戰賽
+# [Leverage Comparison]
 def compare_with_leverage(ticker, df_close):
     if ticker not in df_close.columns: return None
-    # 比較對象
     benchs = ['QQQ', 'QLD', 'TQQQ']
     valid_benchs = [b for b in benchs if b in df_close.columns]
     if not valid_benchs: return None
-    
-    # 取過去 1 年數據 (252天)
     lookback = 252
     if len(df_close) < lookback: lookback = len(df_close)
-    
     df_compare = df_close[[ticker] + valid_benchs].iloc[-lookback:].copy()
-    # 正規化 (歸零比較)
     df_norm = df_compare / df_compare.iloc[0] * 100
-    
-    # 計算績效
     ret_ticker = df_norm[ticker].iloc[-1] - 100
     ret_tqqq = df_norm['TQQQ'].iloc[-1] - 100 if 'TQQQ' in df_norm else 0
-    
     status = "👑 跑贏 TQQQ" if ret_ticker > ret_tqqq else "💀 輸給 TQQQ"
-    
     return df_norm, status, ret_ticker, ret_tqqq
 
 # --- 3. 財務計算 ---
@@ -253,11 +244,11 @@ def main():
         tickers_list = list(portfolio_dict.keys())
         total_value = sum(portfolio_dict.values())
         st.metric("總資產 (Est.)", f"${total_value:,.0f}")
-        if st.button("🚀 啟動槓桿挑戰", type="primary"): st.session_state['run'] = True
+        if st.button("🚀 啟動宏觀全景", type="primary"): st.session_state['run'] = True
 
     if not st.session_state.get('run', False): return
 
-    with st.spinner("🦅 Alpha 10.3 正在進行 QQQ 家族對決..."):
+    with st.spinner("🦅 Alpha 10.4 正在建立宏觀連線..."):
         df_close, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_macro = fetch_fred_macro(fred_key)
         adv_data = {t: get_advanced_info(t) for t in tickers_list}
@@ -268,13 +259,27 @@ def main():
 
     # === TAB 1: 戰略 ===
     with t1:
-        st.subheader("1. 宏觀與總表")
+        st.subheader("1. 宏觀戰情 (Macro Dashboard)")
+        
+        # 1. 數據準備
         liq = df_macro['Net_Liquidity'].iloc[-1] if df_macro is not None else 0
         vix = df_close['^VIX'].iloc[-1] if '^VIX' in df_close.columns else 0
-        c1,c2,c3 = st.columns(3)
-        c1.metric("💧 流動性", f"${liq:.2f}T")
+        tnx = df_close['^TNX'].iloc[-1] if '^TNX' in df_close.columns else 0
+        irx = df_close['^IRX'].iloc[-1] if '^IRX' in df_close.columns else 0 # 13週短債 -> 利率方向
+        
+        # 2. 利率方向判讀
+        fed_status = "維持高利"
+        if irx > 5.2: fed_status = "🦅 升息壓力"
+        elif irx < 4.5: fed_status = "🕊️ 降息預期"
+        
+        # 3. 顯示儀表 (4 Columns)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("💧 淨流動性", f"${liq:.2f}T")
         c2.metric("🌪️ VIX", f"{vix:.2f}", delta_color="inverse")
-        if df_macro is not None: st.plotly_chart(px.line(df_macro, y='Net_Liquidity', title='流動性趨勢', height=250), use_container_width=True)
+        c3.metric("⚖️ 10年殖利率", f"{tnx:.2f}%")
+        c4.metric("🏦 利率方向", fed_status, f"短債 {irx:.2f}%")
+
+        if df_macro is not None: st.plotly_chart(px.line(df_macro, y='Net_Liquidity', title='聯準會流動性趨勢', height=250), use_container_width=True)
 
         st.markdown("#### 📊 持倉戰略總表")
         summary = []
@@ -302,27 +307,19 @@ def main():
             mvrv_s = calc_mvrv_z(df_close[t])
             mvrv = mvrv_s.iloc[-1] if mvrv_s is not None else 0
             
-            # 槓桿比較
             comp_res = compare_with_leverage(t, df_close)
-            if comp_res:
-                df_comp, comp_status, ret_t, ret_b = comp_res
-                status_color = "green" if ret_t > ret_b else "red"
-            else:
-                comp_status, ret_t, ret_b = "N/A", 0, 0
+            comp_status = comp_res[1] if comp_res else "N/A"
             
             t_avg = f"${targets['Avg']:.2f}" if targets and targets['Avg'] else "-"
             
             with st.expander(f"🦅 {t} | MVRV: {mvrv:.2f} | 綜合: {t_avg}", expanded=False):
                 k1, k2, k3 = st.columns([2, 1, 1])
                 with k1:
-                    st.markdown("#### ⚔️ 槓桿挑戰賽 (1 Year)")
+                    st.markdown("#### ⚔️ QQQ 挑戰賽")
                     if comp_res:
-                        st.markdown(f"**結果：** :{status_color}[{comp_status}]")
-                        st.caption(f"{t}: {ret_t:.1f}% vs TQQQ: {ret_b:.1f}%")
-                        fig_comp = px.line(df_comp, title=f"{t} vs QQQ/QLD/TQQQ")
-                        fig_comp.update_layout(height=300, legend=dict(orientation="h", y=1.1))
-                        st.plotly_chart(fig_comp, use_container_width=True)
-                    else: st.write("數據不足無法比較")
+                        st.caption(comp_status)
+                        st.plotly_chart(px.line(comp_res[0], title=f"{t} vs TQQQ").update_layout(height=300), use_container_width=True)
+                    else: st.write("無數據")
 
                 with k2:
                     st.markdown("#### 🎯 五角定位 (1M)")
