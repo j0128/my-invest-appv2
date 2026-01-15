@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 10.5: 體質修復版", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Alpha 10.6: 強韌核心版", layout="wide", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -66,28 +66,46 @@ def get_advanced_info(ticker):
         t = yf.Ticker(ticker)
         info = t.info
         
-        # 嘗試計算 Rule of 40
+        # 1. 辨識資產類別 (ETF vs Stock)
+        q_type = info.get('quoteType', '').upper()
+        is_etf = 'ETF' in q_type or 'MUTUALFUND' in q_type
+        
+        # 2. 強韌化 PEG 計算 (如果 API 沒給，自己算)
+        peg = info.get('pegRatio')
+        fwd_pe = info.get('forwardPE')
+        # 抓取盈餘成長率 (Earnings Growth)
+        earn_growth = info.get('earningsGrowth')
+        
+        if peg is None and fwd_pe is not None and earn_growth is not None and earn_growth > 0:
+            # PEG = PE / Growth Rate (整數)
+            # 例如成長率 0.20 (20%) -> PEG = PE / 20
+            peg = fwd_pe / (earn_growth * 100)
+
+        # 3. 獲利能力備援
+        roe = info.get('returnOnEquity')
+        pm = info.get('profitMargins')
+        
+        # Rule of 40
         rev_g = info.get('revenueGrowth')
-        prof_m = info.get('profitMargins')
-        r40 = (rev_g + prof_m) * 100 if (rev_g is not None and prof_m is not None) else None
+        r40 = (rev_g + pm) * 100 if (rev_g is not None and pm is not None) else None
 
         return {
+            'Type': 'ETF' if is_etf else 'Stock',
             'Target_Mean': info.get('targetMeanPrice'), 
-            'Forward_PE': info.get('forwardPE'),
-            'Trailing_PE': info.get('trailingPE'),
-            'PEG': info.get('pegRatio'),  # 關鍵數據
+            'Forward_PE': fwd_pe,
+            'PEG': peg,
             'Inst_Held': info.get('heldPercentInstitutions'),
             'Insider_Held': info.get('heldPercentInsiders'),
             'Short_Ratio': info.get('shortRatio'),
             'Current_Ratio': info.get('currentRatio'),
             'Debt_Equity': info.get('debtToEquity'),
-            'ROE': info.get('returnOnEquity'), # 關鍵數據
-            'Profit_Margin': prof_m, # 新增備用
+            'ROE': roe,
+            'Profit_Margin': pm,
             'Rule_40': r40
         }
-    except: return {}
+    except: return {'Type': 'Unknown'}
 
-# --- 2. 戰略運算 (AI & Targets & 比較) ---
+# --- 2. 戰略運算 ---
 
 def train_rf_model(df_close, ticker, days_forecast=22):
     try:
@@ -102,7 +120,6 @@ def train_rf_model(df_close, ticker, days_forecast=22):
         df['Target'] = df['Close'].shift(-days_forecast)
         df = df.dropna()
         if len(df) < 60: return None
-        
         X = df.drop(columns=['Target', 'Close'])
         y = df['Target']
         model = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
@@ -146,7 +163,6 @@ def run_backtest_lab(ticker, df_close, df_high, df_low, days_ago=22):
     df_past = df_close.iloc[:idx_past+1]
     
     past_rf = train_rf_model(df_past, ticker, days_ago)
-    
     c_slice = df_close[ticker].iloc[:idx_past+1]
     h_slice = df_high[ticker].iloc[:idx_past+1]
     l_slice = df_low[ticker].iloc[:idx_past+1]
@@ -238,17 +254,17 @@ def main():
     with st.sidebar:
         st.header("⚙️ 設定")
         fred_key = st.secrets.get("FRED_API_KEY", st.text_input("FRED API Key", type="password"))
-        default_input = """BTC-USD, 10000\nAMD, 10000\nNVDA, 10000\nTLT, 5000"""
+        default_input = """BTC-USD, 10000\nAMD, 10000\nNVDA, 10000\nTLT, 5000\nURA, 5000"""
         user_input = st.text_area("持倉清單", default_input, height=150)
         portfolio_dict = parse_input(user_input)
         tickers_list = list(portfolio_dict.keys())
         total_value = sum(portfolio_dict.values())
         st.metric("總資產 (Est.)", f"${total_value:,.0f}")
-        if st.button("🚀 啟動全能版", type="primary"): st.session_state['run'] = True
+        if st.button("🚀 啟動修復版", type="primary"): st.session_state['run'] = True
 
     if not st.session_state.get('run', False): return
 
-    with st.spinner("🦅 Alpha 10.5 正在執行深度掃描..."):
+    with st.spinner("🦅 Alpha 10.6 正在暴力挖掘數據..."):
         df_close, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_macro = fetch_fred_macro(fred_key)
         adv_data = {t: get_advanced_info(t) for t in tickers_list}
@@ -337,32 +353,40 @@ def main():
         dat = [{"代號":t, "機構": f"{adv_data[t].get('Inst_Held',0)*100:.0f}%"} for t in tickers_list if t in df_close.columns]
         st.dataframe(pd.DataFrame(dat), use_container_width=True)
 
-    # === TAB 3: 體質 (Fix) ===
+    # === TAB 3: 體質 (Robust Fix) ===
     with t3:
         st.subheader("🔍 財務體質掃描 (Health Check)")
         health_data = []
         for t in tickers_list:
             info = adv_data.get(t, {})
-            # 格式化檢查: 如果是 None 則顯示 "-"
+            # 判斷是否為 ETF
+            is_etf = info.get('Type') == 'ETF'
+            
+            # PEG 顯示邏輯
             peg = info.get('PEG')
-            peg_s = f"{peg:.2f}" if peg is not None else "-"
+            if is_etf: peg_s = "ETF (N/A)"
+            else: peg_s = f"{peg:.2f}" if peg is not None else "虧損/無數據"
             
+            # ROE 顯示邏輯
             roe = info.get('ROE')
-            roe_s = f"{roe*100:.1f}%" if roe is not None else "-"
+            if is_etf: roe_s = "ETF (N/A)"
+            else: roe_s = f"{roe*100:.1f}%" if roe is not None else "-"
             
+            # Margin 顯示邏輯
             pm = info.get('Profit_Margin')
-            pm_s = f"{pm*100:.1f}%" if pm is not None else "-"
+            if is_etf: pm_s = "ETF (N/A)"
+            else: pm_s = f"{pm*100:.1f}%" if pm is not None else "-"
             
             health_data.append({
                 "代號": t,
-                "PEG (<1低估)": peg_s,
-                "ROE (權益報酬)": roe_s,
-                "淨利率 (Margin)": pm_s,
-                "流動比 (>1.5)": info.get('Current_Ratio'),
-                "負債/權益 (<1)": info.get('Debt_Equity')
+                "PEG": peg_s,
+                "ROE": roe_s,
+                "淨利率": pm_s,
+                "流動比": info.get('Current_Ratio'),
+                "負債/權益": info.get('Debt_Equity')
             })
         st.dataframe(pd.DataFrame(health_data), use_container_width=True)
-        st.caption("💡 提示：ETF (如 TLT, QQQ) 或 虧損公司 通常無 PEG/ROE 數據，此為正常現象。")
+        st.info("💡 說明：ETF (如 URA, TLT) 不具備傳統企業的 PEG、ROE 或淨利率，故顯示不適用。")
 
     # === TAB 4~6 (保留) ===
     with t4:
