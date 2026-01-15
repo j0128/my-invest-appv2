@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # --- 0. 全局設定 ---
-st.set_page_config(page_title="Alpha 10.6: 強韌核心版", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="Alpha 10.7: 穩定修復版", layout="wide", page_icon="🦅")
 
 st.markdown("""
 <style>
@@ -66,27 +66,20 @@ def get_advanced_info(ticker):
         t = yf.Ticker(ticker)
         info = t.info
         
-        # 1. 辨識資產類別 (ETF vs Stock)
+        # 1. 辨識資產類別
         q_type = info.get('quoteType', '').upper()
         is_etf = 'ETF' in q_type or 'MUTUALFUND' in q_type
         
-        # 2. 強韌化 PEG 計算 (如果 API 沒給，自己算)
+        # 2. 強韌化 PEG 計算
         peg = info.get('pegRatio')
         fwd_pe = info.get('forwardPE')
-        # 抓取盈餘成長率 (Earnings Growth)
         earn_growth = info.get('earningsGrowth')
-        
         if peg is None and fwd_pe is not None and earn_growth is not None and earn_growth > 0:
-            # PEG = PE / Growth Rate (整數)
-            # 例如成長率 0.20 (20%) -> PEG = PE / 20
             peg = fwd_pe / (earn_growth * 100)
 
-        # 3. 獲利能力備援
-        roe = info.get('returnOnEquity')
-        pm = info.get('profitMargins')
-        
-        # Rule of 40
+        # 3. Rule of 40
         rev_g = info.get('revenueGrowth')
+        pm = info.get('profitMargins')
         r40 = (rev_g + pm) * 100 if (rev_g is not None and pm is not None) else None
 
         return {
@@ -99,7 +92,7 @@ def get_advanced_info(ticker):
             'Short_Ratio': info.get('shortRatio'),
             'Current_Ratio': info.get('currentRatio'),
             'Debt_Equity': info.get('debtToEquity'),
-            'ROE': roe,
+            'ROE': info.get('returnOnEquity'),
             'Profit_Margin': pm,
             'Rule_40': r40
         }
@@ -166,6 +159,7 @@ def run_backtest_lab(ticker, df_close, df_high, df_low, days_ago=22):
     c_slice = df_close[ticker].iloc[:idx_past+1]
     h_slice = df_high[ticker].iloc[:idx_past+1]
     l_slice = df_low[ticker].iloc[:idx_past+1]
+    
     tr = pd.concat([h_slice-l_slice], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().iloc[-1]
     past_atr = c_slice.iloc[-1] + (atr * np.sqrt(days_ago))
@@ -264,7 +258,7 @@ def main():
 
     if not st.session_state.get('run', False): return
 
-    with st.spinner("🦅 Alpha 10.6 正在暴力挖掘數據..."):
+    with st.spinner("🦅 Alpha 10.7 正在執行安全運算..."):
         df_close, df_high, df_low, df_vol = fetch_market_data(tickers_list)
         df_macro = fetch_fred_macro(fred_key)
         adv_data = {t: get_advanced_info(t) for t in tickers_list}
@@ -347,46 +341,49 @@ def main():
                     fig.update_layout(height=300, margin=dict(l=0,r=0,t=30,b=0), yaxis2=dict(overlaying='y', side='right', showgrid=False))
                     st.plotly_chart(fig, use_container_width=True)
 
-    # === TAB 2: 籌碼 ===
+    # === TAB 2: 籌碼 (FIXED) ===
     with t2:
-        st.subheader("🐋 籌碼")
-        dat = [{"代號":t, "機構": f"{adv_data[t].get('Inst_Held',0)*100:.0f}%"} for t in tickers_list if t in df_close.columns]
-        st.dataframe(pd.DataFrame(dat), use_container_width=True)
+        st.subheader("🐋 籌碼與內部人")
+        chip_data = []
+        for t in tickers_list:
+            if t not in df_close.columns: continue
+            info = adv_data.get(t, {})
+            # 防呆處理
+            inst = info.get('Inst_Held')
+            insider = info.get('Insider_Held')
+            short = info.get('Short_Ratio')
+            
+            chip_data.append({
+                "代號": t,
+                "機構持股": f"{inst*100:.1f}%" if inst is not None else "-",
+                "內部人持股": f"{insider*100:.1f}%" if insider is not None else "-",
+                "空單比例": f"{short:.2f}" if short is not None else "-"
+            })
+        st.dataframe(pd.DataFrame(chip_data), use_container_width=True)
 
-    # === TAB 3: 體質 (Robust Fix) ===
+    # === TAB 3: 體質 (Fix) ===
     with t3:
-        st.subheader("🔍 財務體質掃描 (Health Check)")
+        st.subheader("🔍 財務體質掃描")
         health_data = []
         for t in tickers_list:
+            if t not in df_close.columns: continue
             info = adv_data.get(t, {})
-            # 判斷是否為 ETF
             is_etf = info.get('Type') == 'ETF'
             
-            # PEG 顯示邏輯
             peg = info.get('PEG')
-            if is_etf: peg_s = "ETF (N/A)"
-            else: peg_s = f"{peg:.2f}" if peg is not None else "虧損/無數據"
+            peg_s = "ETF" if is_etf else (f"{peg:.2f}" if peg is not None else "-")
             
-            # ROE 顯示邏輯
             roe = info.get('ROE')
-            if is_etf: roe_s = "ETF (N/A)"
-            else: roe_s = f"{roe*100:.1f}%" if roe is not None else "-"
+            roe_s = "ETF" if is_etf else (f"{roe*100:.1f}%" if roe is not None else "-")
             
-            # Margin 顯示邏輯
             pm = info.get('Profit_Margin')
-            if is_etf: pm_s = "ETF (N/A)"
-            else: pm_s = f"{pm*100:.1f}%" if pm is not None else "-"
+            pm_s = "ETF" if is_etf else (f"{pm*100:.1f}%" if pm is not None else "-")
             
             health_data.append({
-                "代號": t,
-                "PEG": peg_s,
-                "ROE": roe_s,
-                "淨利率": pm_s,
-                "流動比": info.get('Current_Ratio'),
-                "負債/權益": info.get('Debt_Equity')
+                "代號": t, "PEG": peg_s, "ROE": roe_s, "淨利率": pm_s,
+                "流動比": info.get('Current_Ratio'), "負債/權益": info.get('Debt_Equity')
             })
         st.dataframe(pd.DataFrame(health_data), use_container_width=True)
-        st.info("💡 說明：ETF (如 URA, TLT) 不具備傳統企業的 PEG、ROE 或淨利率，故顯示不適用。")
 
     # === TAB 4~6 (保留) ===
     with t4:
