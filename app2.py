@@ -1,20 +1,12 @@
-# @title 🦅 App 3: 個人資產戰略指揮系統 (Alpha 32 Production)
-# @markdown **功能：** 輸入您的持倉，系統自動套用最佳權重模型，計算回測誤差，並給出下個月的戰略劇本。
-
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from scipy import stats
-from datetime import datetime, timedelta
-import plotly.graph_objects as go
-import plotly.express as px
+# @title 🦅 App 5.0: 全自動真實情報指揮官 (12個月深度版)
+# @markdown **功能升級：**<br>1. **深度考古**：鎖定挖掘過去 12 個月的真實新聞。<br>2. **安全啟動**：等待您確認持倉後才開始執行。<br>3. **真實回測**：用一整年的數據驗證 Alpha 32 準確度。
 
 # ==========================================
-# 1. 您的資產輸入區 (User Input)
+# 1. 您的資產輸入區 (請在此修改)
 # ==========================================
-# 請依照格式輸入：'Ticker': 成本價
 MY_PORTFOLIO = {
-    'TSM':  145.0,  # 範例
+    # 格式: '股票代號': 您的成本價
+    'TSM':  145.0,  
     'NVDA': 120.0,
     'AMD':  160.0,
     'SOXL': 35.0,
@@ -22,198 +14,222 @@ MY_PORTFOLIO = {
     'BTC-USD': 65000.0
 }
 
+# 設定回測新聞長度 (月)
+HISTORY_MONTHS = 12 
+
 # ==========================================
-# 2. Alpha 32 戰略權重庫 (The Brain)
+# (以下為系統核心，無需修改)
 # ==========================================
-# 這是我們經過無數次實驗得出的最佳配置
+
+# 0. 環境準備與安全啟動
+try:
+    import feedparser
+    import textblob
+    import tabulate
+except ImportError:
+    print("正在安裝組件...")
+    !pip install feedparser textblob tabulate -q
+
+import feedparser
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from textblob import TextBlob
+from scipy import stats
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+import time
+import random
+import plotly.graph_objects as go
+
+# 等待使用者確認
+print(f"📋 目前設定的持倉清單: {list(MY_PORTFOLIO.keys())}")
+print(f"🕒 預計抓取新聞長度: {HISTORY_MONTHS} 個月")
+input("⚠️ 請確認上方 `MY_PORTFOLIO` 已修改完畢。準備好後，請點擊此處並按 [Enter] 鍵開始執行...")
+
+# 1. RSS 歷史駭客
+def hack_historical_news(ticker, months):
+    print(f"  ⛏️ [RSS Hacker] 正在挖掘 {ticker} 過去 {months} 個月的真實新聞...", end=" ")
+    news_pool = []
+    
+    end_date = datetime.now()
+    start_date = end_date - relativedelta(months=months)
+    
+    # 關鍵字加權字典
+    KEYWORDS = {
+        'BOOST': ['beat', 'record', 'deal', 'partnership', 'approval', 'hike', 'surge', 'jump', 'buy', 'upgrade'],
+        'DRAG':  ['miss', 'ban', 'restriction', 'probe', 'fraud', 'plunge', 'drop', 'cut', 'sell', 'downgrade']
+    }
+
+    current = start_date
+    count = 0
+    
+    while current < end_date:
+        next_month = current + relativedelta(months=1)
+        d_after = current.strftime('%Y-%m-%d')
+        d_before = next_month.strftime('%Y-%m-%d')
+        
+        rss_url = f"https://news.google.com/rss/search?q={ticker}+stock+after:{d_after}+before:{d_before}&hl=en-US&gl=US&ceid=US:en"
+        
+        try:
+            feed = feedparser.parse(rss_url)
+            for entry in feed.entries:
+                title = entry.title
+                base_score = TextBlob(title).sentiment.polarity
+                
+                boost = 0
+                t_lower = title.lower()
+                for k in KEYWORDS['BOOST']: 
+                    if k in t_lower: boost += 0.3
+                for k in KEYWORDS['DRAG']: 
+                    if k in t_lower: boost -= 0.3
+                
+                final_score = np.clip(base_score + boost, -1, 1)
+                
+                news_pool.append({
+                    'Date': pd.to_datetime(entry.published).date(),
+                    'Title': title,
+                    'Score': final_score
+                })
+                count += 1
+        except: pass
+        
+        current = next_month
+        # 隨機延遲 1.5 ~ 3 秒，避免跑 12 個月被 Google 封鎖
+        time.sleep(random.uniform(1.5, 3.0))
+    
+    print(f"✅ 捕獲 {count} 條。")
+    if not news_pool:
+        return pd.DataFrame(columns=['Date', 'Title', 'Score'])
+    
+    df = pd.DataFrame(news_pool)
+    df['Date'] = pd.to_datetime(df['Date'])
+    return df
+
+# 2. Alpha 32 權重配置
 STRATEGY_DB = {
-    # 機構型：高度依賴新聞 (擴廠/財報)
     'TSM': {'Type': '機構型', 'W': {'Fund': 0.2, 'Tech': 0.2, 'News': 0.6}},
     'CLS': {'Type': '機構型', 'W': {'Fund': 0.5, 'Tech': 0.2, 'News': 0.3}},
-    
-    # 信仰/網紅型：新聞雜訊多，強制降權，依賴技術面
     'NVDA': {'Type': '信仰型', 'W': {'Fund': 0.1, 'Tech': 0.7, 'News': 0.2}},
     'BTC-USD': {'Type': '信仰型', 'W': {'Fund': 0.0, 'Tech': 0.6, 'News': 0.4}},
-    
-    # 投機型：波動大，混合判斷
     'SOXL': {'Type': '投機型', 'W': {'Fund': 0.1, 'Tech': 0.5, 'News': 0.4}},
     'AMD':  {'Type': '成長型', 'W': {'Fund': 0.3, 'Tech': 0.4, 'News': 0.3}},
-    
-    # 預設 (未知股票)
     'DEFAULT': {'Type': '一般型', 'W': {'Fund': 0.33, 'Tech': 0.33, 'News': 0.33}}
 }
 
-# ==========================================
-# 3. 核心運算引擎 (Engine)
-# ==========================================
-
-def get_implied_news_score(df):
-    """
-    計算隱含新聞分數 (Implied Sentiment)
-    邏輯：成交量 Z-Score > 1.5 且 價格變動大 = 重大新聞發生
-    """
-    df['Vol_Mean'] = df['Volume'].rolling(20).mean()
-    df['Vol_Std'] = df['Volume'].rolling(20).std()
-    df['Vol_Z'] = (df['Volume'] - df['Vol_Mean']) / (df['Vol_Std'] + 1e-9) # 避免除以0
-    
-    # 如果爆量且漲 -> 正分；爆量且跌 -> 負分
-    # 我們平滑化 3 天，模擬新聞餘波
-    raw_score = np.where(df['Vol_Z'] > 1.5, np.sign(df['Close'].pct_change()) * 1, 0)
-    return pd.Series(raw_score, index=df.index).rolling(3).mean().fillna(0)
-
-def analyze_asset(ticker, cost_basis):
-    # 1. 下載數據
-    df = yf.download(ticker, period="18mo", progress=False, auto_adjust=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        temp = df['Close'][[ticker]].copy(); temp.columns = ['Close']
-        temp['Volume'] = df['Volume'][ticker]
-        df = temp
+# 3. 核心運算引擎
+def analyze_asset_full_auto(ticker, cost_basis):
+    # 下載股價 (包含過去 18 個月以配合 12 個月新聞 + 指標運算)
+    df_price = yf.download(ticker, period="2y", progress=False, auto_adjust=True)
+    if isinstance(df_price.columns, pd.MultiIndex):
+        temp = df_price['Close'][[ticker]].copy(); temp.columns = ['Close']
+        df_price = temp
     else:
-        df = df[['Close', 'Volume']]
+        df_price = df_price[['Close']]
     
-    # 2. 計算三大因子
-    # F: 基本面 (估值位階)
-    df['MA200'] = df['Close'].rolling(200).mean()
-    df['Bias'] = (df['Close'] - df['MA200']) / df['MA200']
-    df['Val_Rank'] = df['Bias'].rolling(252).apply(lambda x: stats.percentileofscore(x, x[-1]), raw=True)
-    df['Score_F'] = (50 - df['Val_Rank']) / 50 # -1 ~ 1
+    # 現場抓取真實歷史新聞
+    df_news = hack_historical_news(ticker, HISTORY_MONTHS)
     
-    # T: 技術面 (趨勢)
-    df['MA20'] = df['Close'].rolling(20).mean()
-    df['Score_T'] = np.where(df['Close'] > df['MA20'], 0.8, -0.8)
+    if not df_news.empty:
+        daily_news = df_news.groupby('Date')['Score'].mean()
+        df_price = df_price.join(daily_news, how='left').fillna(0)
+        df_price['News_Factor'] = df_price['Score'].rolling(3).mean()
+    else:
+        df_price['News_Factor'] = 0
     
-    # N: 消息面 (隱含情緒)
-    df['Score_N'] = get_implied_news_score(df) * 2 # 放大訊號
+    # F: 基本面
+    df_price['MA200'] = df_price['Close'].rolling(200).mean()
+    df_price['Bias'] = (df_price['Close'] - df_price['MA200']) / df_price['MA200']
+    df_price['Score_F'] = -np.clip(df_price['Bias'] * 2, -1, 1) 
     
-    # 3. 取得權重
+    # T: 技術面
+    df_price['MA20'] = df_price['Close'].rolling(20).mean()
+    df_price['Score_T'] = np.where(df_price['Close'] > df_price['MA20'], 0.8, -0.8)
+    
+    # 套用權重
     strategy = STRATEGY_DB.get(ticker, STRATEGY_DB['DEFAULT'])
     w = strategy['W']
     
-    # 4. 合成 Alpha 預測值
-    df['Alpha_Score'] = (df['Score_F'] * w['Fund']) + \
-                        (df['Score_T'] * w['Tech']) + \
-                        (df['Score_N'] * w['News'])
+    df_price['Alpha_Score'] = (df_price['Score_F'] * w['Fund']) + \
+                              (df_price['Score_T'] * w['Tech']) + \
+                              (df_price['News_Factor'] * w['News'])
+                              
+    # 回測誤差 (使用過去 12 個月的數據)
+    df_price['Pred_Target'] = df_price['Close'] * (1 + df_price['Alpha_Score'] * 0.05)
     
-    # 預測變動 (假設最大波動幅度 5%)
-    df['Pred_Price'] = df['Close'] * (1 + df['Alpha_Score'] * 0.05)
-    
-    # 5. 回測 (最近 252 天)
-    backtest_df = df.iloc[-252-30:-30].copy()
-    if len(backtest_df) > 0:
-        # 簡單驗證：30天後的真實價格 vs 當初預測
-        actual_future = df['Close'].iloc[-252:]
-        # 對齊索引比較 (這裡做簡單 MAPE 計算)
-        # 由於向量長度對齊複雜，我們取最後 100 天做平均誤差估算
-        recent_actual = df['Close'].tail(100)
-        recent_pred = df['Pred_Price'].shift(30).tail(100) # 30天前的預測
-        error = (abs(recent_actual - recent_pred) / recent_actual).mean()
+    valid_data = df_price.dropna()
+    if len(valid_data) > 60:
+        real_future = valid_data['Close']
+        past_pred = valid_data['Pred_Target'].shift(30)
+        # 計算最近 6 個月的平均誤差
+        error = (abs(real_future - past_pred) / real_future).tail(120).mean()
     else:
-        error = 0.15 # 預設值
+        error = 0.20
         
-    # 6. 未來預測 (Next 30 Days)
-    current_price = df['Close'].iloc[-1]
-    current_score = df['Alpha_Score'].iloc[-1]
+    current_price = df_price['Close'].iloc[-1]
+    current_alpha = df_price['Alpha_Score'].iloc[-1]
+    vol = df_price['Close'].pct_change().rolling(30).std().iloc[-1] * np.sqrt(30)
     
-    # 計算波動率 (箱體寬度)
-    vol_30d = df['Close'].pct_change().rolling(30).std().iloc[-1] * np.sqrt(30)
-    
-    target_price = current_price * (1 + current_score * 0.05)
-    box_high = target_price * (1 + vol_30d * 1.5)
-    box_low = target_price * (1 - vol_30d * 1.5)
-    
-    # 計算潛在盈虧
+    target_price = current_price * (1 + current_alpha * 0.05)
+    box_high = target_price * (1 + vol * 1.5)
+    box_low = target_price * (1 - vol * 1.5)
     pnl_pct = (current_price - cost_basis) / cost_basis
+
+    latest_news = df_news.iloc[-1]['Title'] if not df_news.empty else "無近期新聞"
     
     return {
-        'Ticker': ticker,
-        'Type': strategy['Type'],
-        'Cost': cost_basis,
-        'Current': current_price,
-        'PnL%': pnl_pct,
-        'Model_Error': error,
-        'Score': current_score, # 綜合得分
-        'Target': target_price,
-        'Buy_Zone': box_low,
-        'Sell_Zone': box_high,
+        'Ticker': ticker, 'Type': strategy['Type'], 'Cost': cost_basis,
+        'Current': current_price, 'PnL%': pnl_pct, 'Model_Error': error,
+        'Latest_News': latest_news[:30] + "...",
+        'Score': current_alpha, 'Target': target_price,
+        'Buy_Zone': box_low, 'Sell_Zone': box_high,
         'Action': '加碼' if current_price < box_low else ('獲利了結' if current_price > box_high else '續抱')
     }
 
-# ==========================================
-# 4. 執行全資產掃描
-# ==========================================
-print("🦅 App 3: 正在掃描您的資產庫，啟動 Alpha 32 運算...\n")
-portfolio_data = []
+# 4. 執行
+print("\n🦅 App 5.0: 啟動全自動真實情報掃描...")
+print("---------------------------------------------------------------")
+portfolio_results = []
 
 for t, c in MY_PORTFOLIO.items():
     try:
-        data = analyze_asset(t, c)
-        portfolio_data.append(data)
-        print(f"  ✅ {t} 分析完成 (誤差: {data['Model_Error']:.1%})")
+        data = analyze_asset_full_auto(t, c)
+        portfolio_results.append(data)
     except Exception as e:
-        print(f"  ❌ {t} 分析失敗: {e}")
+        print(f"❌ {t} 失敗: {e}")
 
-# ==========================================
-# 5. 戰略儀表板 (Dashboard)
-# ==========================================
-df_res = pd.DataFrame(portfolio_data)
-
-# A. 核心數據表
-display_cols = ['Ticker', 'Type', 'Current', 'Cost', 'PnL%', 'Target', 'Buy_Zone', 'Sell_Zone', 'Action']
-print("\n📊 === 個人資產戰略地圖 (Next 30 Days) ===")
-# 格式化
-fmt_df = df_res.copy()
-for col in ['Current', 'Cost', 'Target', 'Buy_Zone', 'Sell_Zone']:
-    fmt_df[col] = fmt_df[col].apply(lambda x: f"${x:.2f}")
-fmt_df['PnL%'] = fmt_df['PnL%'].apply(lambda x: f"{x:+.2%}")
-
-print(fmt_df[display_cols].to_markdown(index=False))
-
-# B. 視覺化：風險收益矩陣
-fig = go.Figure()
-
-# 繪製箱體
-for i, row in df_res.iterrows():
-    color = 'cyan' if row['PnL%'] > 0 else 'red'
+# 5. 儀表板
+if portfolio_results:
+    df_res = pd.DataFrame(portfolio_results)
     
-    # 箱體 (預測範圍)
-    fig.add_trace(go.Box(
-        y=[row['Buy_Zone'], row['Target'], row['Target'], row['Sell_Zone']],
-        name=f"{row['Ticker']} ({row['PnL%']:.1%})",
-        marker_color=color,
-        boxpoints=False
-    ))
+    print("\n📊 === Alpha 32 真實戰略地圖 (12個月回測版) ===")
+    fmt_df = df_res.copy()
+    for col in ['Current', 'Cost', 'Target', 'Buy_Zone', 'Sell_Zone']:
+        fmt_df[col] = fmt_df[col].apply(lambda x: f"${x:.2f}")
+    fmt_df['PnL%'] = fmt_df['PnL%'].apply(lambda x: f"{x:+.2%}")
+    fmt_df['Model_Error'] = fmt_df['Model_Error'].apply(lambda x: f"{x:.1%}")
     
-    # 成本線 (虛線)
-    fig.add_trace(go.Scatter(
-        x=[f"{row['Ticker']} ({row['PnL%']:.1%})"], y=[row['Cost']],
-        mode='markers+text', marker=dict(symbol='line-ew', size=50, color='white', line=dict(width=3)),
-        text=['COST'], textposition='bottom center',
-        name='成本價'
-    ))
+    cols = ['Ticker', 'Type', 'Model_Error', 'Current', 'Target', 'Buy_Zone', 'Action']
+    print(fmt_df[cols].to_markdown(index=False))
     
-    # 現價 (菱形)
-    fig.add_trace(go.Scatter(
-        x=[f"{row['Ticker']} ({row['PnL%']:.1%})"], y=[row['Current']],
-        mode='markers', marker=dict(symbol='diamond', size=12, color='yellow'),
-        name='現價'
-    ))
+    fig = go.Figure()
+    for i, row in df_res.iterrows():
+        color = 'cyan' if row['PnL%'] > 0 else 'red'
+        fig.add_trace(go.Box(
+            y=[row['Buy_Zone'], row['Target'], row['Target'], row['Sell_Zone']],
+            name=f"{row['Ticker']} (Err {row['Model_Error']})",
+            marker_color=color, boxpoints=False
+        ))
+        fig.add_trace(go.Scatter(
+            x=[f"{row['Ticker']} (Err {row['Model_Error']})"], y=[row['Cost']],
+            mode='markers+text', marker=dict(symbol='line-ew', size=50, color='white', line=dict(width=3)),
+            name='成本'
+        ))
+        fig.add_trace(go.Scatter(
+            x=[f"{row['Ticker']} (Err {row['Model_Error']})"], y=[row['Current']],
+            mode='markers', marker=dict(symbol='diamond', size=12, color='yellow'),
+            name='現價'
+        ))
 
-fig.update_layout(
-    title="<b>資產戰略分佈圖</b><br>箱體=下月預測 | 白線=您的成本 | 黃鑽=現價",
-    template="plotly_dark",
-    yaxis_title="價格 (USD)",
-    showlegend=False,
-    height=500
-)
-fig.show()
-
-# C. 指揮官總評
-avg_score = df_res['Score'].mean()
-print(f"\n🦅 指揮官總評：")
-print(f"您的投資組合平均戰略得分為 **{avg_score:+.2f}** (-1 ~ +1)。")
-if avg_score > 0.1:
-    print("🚀 結論：整體趨勢向上。TSM 等權重股有新聞支撐，建議在 Buy Zone 附近積極加碼。")
-elif avg_score < -0.1:
-    print("🛡️ 結論：整體動能轉弱。請注意 NVDA 是否跌破 Sell Zone，若跌破建議部分獲利了結。")
-else:
-    print("⚖️ 結論：市場處於震盪平衡。請嚴格執行高出低進 (Box Trading)。")
+    fig.update_layout(title="App 5.0 資產戰略圖 (12個月新聞回測)", template="plotly_dark", yaxis_title="價格 (USD)", showlegend=False, height=500)
+    fig.show()
