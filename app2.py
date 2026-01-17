@@ -14,46 +14,43 @@ import plotly.graph_objects as go
 # ==========================================
 # 0. 頁面設定
 # ==========================================
-st.set_page_config(page_title="App 5.0 全自動情報指揮官", layout="wide")
+st.set_page_config(page_title="App 6.0 羅盤指揮官", layout="wide")
 
-st.title("🦅 App 5.0: 全自動真實情報指揮官 (12個月深度版)")
+st.title("🦅 App 6.0: 全自動羅盤指揮官 (含方向準確度)")
 st.markdown("""
-**功能說明：**
-1. **深度考古**：現場挖掘過去 12 個月的真實新聞 (Google RSS)。
-2. **智能權重**：針對個股性格套用 Alpha 32 最佳權重。
-3. **安全啟動**：請在下方編輯持倉，確認無誤後點擊按鈕開始。
+**升級重點：**
+1. **方向準確度 (Dir. Acc)**：顯示模型預測漲跌的勝率。模糊的正確 > 精確的錯誤。
+2. **短代碼修復**：修正 URA 等短代碼抓錯新聞的問題。
+3. **戰略地圖**：結合價格誤差與方向勝率的綜合評估。
 """)
 
 # ==========================================
-# 1. 您的資產輸入區 (互動式表格)
+# 1. 您的資產輸入區
 # ==========================================
-st.subheader("1. 持倉設定 (請直接修改表格)")
+st.subheader("1. 持倉設定")
 
-# 預設持倉數據
 default_data = pd.DataFrame([
     {"Ticker": "TSM", "Cost": 145.0},
     {"Ticker": "NVDA", "Cost": 120.0},
     {"Ticker": "AMD", "Cost": 160.0},
     {"Ticker": "SOXL", "Cost": 35.0},
     {"Ticker": "CLS", "Cost": 60.0},
-    {"Ticker": "BTC-USD", "Cost": 65000.0}
+    {"Ticker": "BTC-USD", "Cost": 65000.0},
+    {"Ticker": "URA", "Cost": 30.0},
+    {"Ticker": "META", "Cost": 580.0},
+    {"Ticker": "TLT", "Cost": 95.0}
 ])
 
-# 讓使用者在網頁上編輯
 edited_df = st.data_editor(default_data, num_rows="dynamic")
-
-# 轉換回字典格式供程式使用
 MY_PORTFOLIO = dict(zip(edited_df['Ticker'], edited_df['Cost']))
 HISTORY_MONTHS = 12 
 
 # ==========================================
-# 2. 核心功能函式庫
+# 2. 核心功能
 # ==========================================
 
-@st.cache_data(ttl=3600) # 加入快取，避免重複抓取浪費時間
+@st.cache_data(ttl=3600)
 def hack_historical_news(ticker, months):
-    """RSS 歷史新聞駭客"""
-    # st.write(f"  ⛏️ [RSS Hacker] 正在挖掘 {ticker}...")
     news_pool = []
     end_date = datetime.now()
     start_date = end_date - relativedelta(months=months)
@@ -63,16 +60,19 @@ def hack_historical_news(ticker, months):
         'DRAG':  ['miss', 'ban', 'restriction', 'probe', 'fraud', 'plunge', 'drop', 'cut', 'sell', 'downgrade']
     }
 
+    # 修復短代碼問題 (如 URA, CLS)
+    search_ticker = ticker
+    if len(ticker) <= 4 and "-" not in ticker:
+        search_ticker = f"{ticker} stock" # 強制加上 stock 關鍵字
+
     current = start_date
-    progress_text = f"正在掃描 {ticker} 歷史新聞..."
-    # 這裡不顯示進度條以免畫面太亂，改用後台執行
     
     while current < end_date:
         next_month = current + relativedelta(months=1)
         d_after = current.strftime('%Y-%m-%d')
         d_before = next_month.strftime('%Y-%m-%d')
         
-        rss_url = f"https://news.google.com/rss/search?q={ticker}+stock+after:{d_after}+before:{d_before}&hl=en-US&gl=US&ceid=US:en"
+        rss_url = f"https://news.google.com/rss/search?q={search_ticker}+after:{d_after}+before:{d_before}&hl=en-US&gl=US&ceid=US:en"
         
         try:
             feed = feedparser.parse(rss_url)
@@ -96,8 +96,7 @@ def hack_historical_news(ticker, months):
                 })
         except: pass
         current = next_month
-        # 在 Streamlit 中稍微減少延遲，因為會並行處理
-        time.sleep(0.5) 
+        time.sleep(0.3) 
     
     if not news_pool:
         return pd.DataFrame(columns=['Date', 'Title', 'Score'])
@@ -116,8 +115,8 @@ STRATEGY_DB = {
     'DEFAULT': {'Type': '一般型', 'W': {'Fund': 0.33, 'Tech': 0.33, 'News': 0.33}}
 }
 
-def analyze_asset_full_auto(ticker, cost_basis):
-    # 下載股價
+def analyze_asset_compass(ticker, cost_basis):
+    # 下載數據 (2年)
     df_price = yf.download(ticker, period="2y", progress=False, auto_adjust=True)
     if isinstance(df_price.columns, pd.MultiIndex):
         temp = df_price['Close'][[ticker]].copy(); temp.columns = ['Close']
@@ -151,14 +150,29 @@ def analyze_asset_full_auto(ticker, cost_basis):
                               (df_price['Score_T'] * w['Tech']) + \
                               (df_price['News_Factor'] * w['News'])
                               
-    # 回測誤差
+    # --- 回測核心：方向準確度 (Directional Accuracy) ---
+    # 預測 30 天後的漲跌
     df_price['Pred_Target'] = df_price['Close'] * (1 + df_price['Alpha_Score'] * 0.05)
+    
     valid_data = df_price.dropna()
+    
     if len(valid_data) > 60:
+        # 真實的 30 天變動 (未來 - 現在)
+        real_move = valid_data['Close'] - valid_data['Close'].shift(30)
+        # 預測的 30 天變動 (預測 - 現在)
+        pred_move = valid_data['Pred_Target'].shift(30) - valid_data['Close'].shift(30)
+        
+        # 1. 計算方向準確度 (同號為 True)
+        # 用最近 120 天 (半年) 的數據來算勝率
+        matches = np.sign(real_move) == np.sign(pred_move)
+        dir_acc = matches.tail(120).mean()
+        
+        # 2. 計算價格誤差 (MAPE)
         real_future = valid_data['Close']
         past_pred = valid_data['Pred_Target'].shift(30)
         error = (abs(real_future - past_pred) / real_future).tail(120).mean()
     else:
+        dir_acc = 0.5 # 資料不足，跟丟銅板一樣
         error = 0.20
         
     current_price = df_price['Close'].iloc[-1]
@@ -174,7 +188,8 @@ def analyze_asset_full_auto(ticker, cost_basis):
     
     return {
         'Ticker': ticker, 'Type': strategy['Type'], 'Cost': cost_basis,
-        'Current': current_price, 'PnL%': pnl_pct, 'Model_Error': error,
+        'Current': current_price, 'PnL%': pnl_pct, 
+        'Model_Error': error, 'Dir_Acc': dir_acc, # 新增指標
         'Latest_News': latest_news,
         'Score': current_alpha, 'Target': target_price,
         'Buy_Zone': box_low, 'Sell_Zone': box_high,
@@ -185,9 +200,8 @@ def analyze_asset_full_auto(ticker, cost_basis):
 # 3. 執行介面
 # ==========================================
 st.subheader("2. 啟動指揮官")
-st.info("⚠️ 注意：程式將連線 Google 抓取大量數據，每檔股票約需 5-10 秒，請耐心等待。")
 
-if st.button("🚀 開始全域掃描", type="primary"):
+if st.button("🚀 啟動羅盤掃描", type="primary"):
     results = []
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -195,9 +209,9 @@ if st.button("🚀 開始全域掃描", type="primary"):
     total_tickers = len(MY_PORTFOLIO)
     
     for i, (ticker, cost) in enumerate(MY_PORTFOLIO.items()):
-        status_text.text(f"正在分析 {ticker} ({i+1}/{total_tickers})...")
+        status_text.text(f"正在分析 {ticker} ({i+1}/{total_tickers}) - 掃描方向性中...")
         try:
-            data = analyze_asset_full_auto(ticker, cost)
+            data = analyze_asset_compass(ticker, cost)
             results.append(data)
         except Exception as e:
             st.error(f"❌ {ticker} 分析失敗: {e}")
@@ -212,56 +226,64 @@ if st.button("🚀 開始全域掃描", type="primary"):
     if results:
         df_res = pd.DataFrame(results)
         
-        st.subheader("📊 Alpha 32 真實戰略地圖")
+        st.subheader("📊 Alpha 32 戰略地圖 (含方向勝率)")
         
         # 顯示主要表格
-        display_df = df_res[['Ticker', 'Type', 'Model_Error', 'Current', 'Target', 'Buy_Zone', 'Sell_Zone', 'Action']].copy()
+        display_df = df_res[['Ticker', 'Type', 'Dir_Acc', 'Model_Error', 'Current', 'Buy_Zone', 'Target', 'Sell_Zone', 'Action']].copy()
         
         # 格式化顯示
-        for col in ['Current', 'Target', 'Buy_Zone', 'Sell_Zone']:
-            display_df[col] = display_df[col].apply(lambda x: f"${x:.2f}")
+        display_df['Dir_Acc'] = display_df['Dir_Acc'].apply(lambda x: f"{x:.0%}") # 勝率
         display_df['Model_Error'] = display_df['Model_Error'].apply(lambda x: f"{x:.1%}")
         
-        st.table(display_df)
+        for col in ['Current', 'Target', 'Buy_Zone', 'Sell_Zone']:
+            display_df[col] = display_df[col].apply(lambda x: f"${x:.2f}")
+            
+        # 使用顏色標記勝率
+        st.dataframe(display_df.style.map(
+            lambda x: 'color: lightgreen' if isinstance(x, str) and '%' in x and float(x.strip('%')) > 60 else '', 
+            subset=['Dir_Acc']
+        ))
         
-        # 繪製 Plotly 圖表
-        fig = go.Figure()
+        st.markdown("""
+        **指標解讀：**
+        * **方向勝率 (Dir_Acc)**：越高越好。**>60%** 代表模型對這檔股票的漲跌判斷很有優勢。
+        * **價格誤差 (Model_Error)**：越低越好。代表預測點位精準。
+        """)
+        
+        # 繪製 Plotly 圖表 (氣泡圖：勝率 vs 誤差)
+        fig_bubble = go.Figure()
+        
         for i, row in df_res.iterrows():
-            color = 'cyan' if row['PnL%'] > 0 else 'red'
+            # 氣泡顏色：綠色=高勝率，紅色=低勝率
+            color = '#00FF7F' if row['Dir_Acc'] > 0.6 else '#FF4B4B'
             
-            # 戰略箱體
-            fig.add_trace(go.Box(
-                y=[row['Buy_Zone'], row['Target'], row['Target'], row['Sell_Zone']],
-                name=f"{row['Ticker']}",
-                marker_color=color,
-                boxpoints=False,
-                hoverinfo='y+name'
-            ))
-            
-            # 成本線
-            fig.add_trace(go.Scatter(
-                x=[row['Ticker']], y=[row['Cost']],
-                mode='markers', marker=dict(symbol='line-ew', size=50, color='white', line=dict(width=3)),
-                name='成本價'
-            ))
-            
-            # 現價
-            fig.add_trace(go.Scatter(
-                x=[row['Ticker']], y=[row['Current']],
-                mode='markers', marker=dict(symbol='diamond', size=12, color='yellow'),
-                name='現價'
+            fig_bubble.add_trace(go.Scatter(
+                x=[row['Model_Error']], 
+                y=[row['Dir_Acc']],
+                mode='markers+text',
+                text=[row['Ticker']],
+                textposition="top center",
+                marker=dict(size=30, color=color, opacity=0.7),
+                name=row['Ticker'],
+                hovertemplate="<b>%{text}</b><br>方向勝率: %{y:.0%}<br>價格誤差: %{x:.1%}"
             ))
 
-        fig.update_layout(
-            title="戰略區間分佈 (箱體=預測 | 白線=成本 | 黃鑽=現價)",
+        fig_bubble.update_layout(
+            title="<b>模型可信度矩陣</b> (右上角=危險, 左上角=聖杯)",
+            xaxis_title="價格誤差 (越左越好)",
+            yaxis_title="方向勝率 (越上越好)",
+            xaxis=dict(autorange="reversed"), # 讓誤差小的在右邊 (或維持原樣，越左越小) -> 這裡我讓越左越小比較直觀
             template="plotly_dark",
-            yaxis_title="價格 (USD)",
-            height=600,
-            showlegend=False
+            showlegend=False,
+            height=400
         )
-        st.plotly_chart(fig, use_container_width=True)
+        # 畫十字線 (60% 勝率 / 15% 誤差)
+        fig_bubble.add_hline(y=0.6, line_dash="dash", line_color="gray", annotation_text="及格線 (60%)")
+        fig_bubble.add_vline(x=0.15, line_dash="dash", line_color="gray", annotation_text="精準線 (15%)")
         
-        # 顯示詳細新聞資訊
-        with st.expander("📰 查看最新情報來源"):
+        st.plotly_chart(fig_bubble, use_container_width=True)
+        
+        # 顯示詳細新聞
+        with st.expander("📰 查看新聞來源"):
             for res in results:
                 st.markdown(f"**{res['Ticker']}**: {res['Latest_News']}")
