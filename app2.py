@@ -9,23 +9,22 @@ from dateutil.relativedelta import relativedelta
 import time
 import urllib.parse
 import plotly.graph_objects as go
-from sklearn.ensemble import RandomForestRegressor # 引入隨機森林
+from sklearn.ensemble import RandomForestRegressor
 
 # ==========================================
 # 0. 頁面設定
 # ==========================================
-st.set_page_config(page_title="App 9.0 狙擊手指揮官", layout="wide")
+st.set_page_config(page_title="App 9.1 狙擊手回測版", layout="wide")
 
-st.title("🦅 App 9.0: 狙擊手指揮官 (數據分離版)")
+st.title("🦅 App 9.1: 狙擊手指揮官 (含真實勝率回測)")
 st.markdown("""
-**系統架構：**
-1.  **數據層 (Data Layer)**：支援「即時爬取 12 個月新聞」或「匯入歷史新聞 CSV」。
-2.  **定價層 (Pricing Layer)**：整合 RF 隨機森林、ATR 波動率、Fibonacci、均值回歸。
-3.  **決策層 (Sniper Layer)**：**新聞 + OBV + 成交量 Z-Score** 三位一體確認。
+**回測機制升級：**
+1.  **狙擊勝率 (Sniper Win Rate)**：統計過去一年，當「新聞+OBV+爆量」三燈全亮時，進場持有 1 個月(22交易日)的勝率。
+2.  **方向準確度 (Dir Acc)**：綜合評分對於「下個月漲跌」判斷的長期準確度。
 """)
 
 # ==========================================
-# 1. 數據層：全球新聞爬蟲 (支援匯出)
+# 1. 數據層：全球新聞爬蟲
 # ==========================================
 TICKER_MAP = {
     'TSM': {'TW': '台積電', 'JP': 'TSMC', 'EU': 'TSMC'},
@@ -44,10 +43,9 @@ MULTILINGUAL_DICT = {
 
 @st.cache_data(ttl=3600*24)
 def fetch_global_news_12m(ticker):
-    """抓取過去 12 個月新聞，回傳 DataFrame"""
     news_history = []
     end_date = datetime.now()
-    start_date = end_date - relativedelta(months=12) # 強制一年
+    start_date = end_date - relativedelta(months=12) 
     
     map_info = TICKER_MAP.get(ticker, {})
     term_us = f"{ticker}+stock" if len(ticker) <= 4 else ticker
@@ -61,27 +59,23 @@ def fetch_global_news_12m(ticker):
         d_after = current.strftime('%Y-%m-%d')
         d_before = next_month.strftime('%Y-%m-%d')
         
-        # 定義四個節點
         urls = [
             (f"https://news.google.com/rss/search?q={term_us}+after:{d_after}+before:{d_before}&hl=en-US&gl=US&ceid=US:en", 'US'),
             (f"https://news.google.com/rss/search?q={term_us}+after:{d_after}+before:{d_before}&hl=en-GB&gl=GB&ceid=GB:en", 'EU_UK')
         ]
-        # 特定股票加抓在地新聞
         if ticker in ['TSM', 'NVDA', 'AMD', '0050.TW', 'CLS', 'SOXL']:
             urls.append((f"https://news.google.com/rss/search?q={term_tw}+after:{d_after}+before:{d_before}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant", 'TW'))
-        if ticker in ['TSM', 'NVDA', 'SOXL', 'URA']:
+        if ticker in ['TSM', 'NVDA', 'SOXL', 'URA', 'BTC-USD']:
             urls.append((f"https://news.google.com/rss/search?q={term_jp}+after:{d_after}+before:{d_before}&hl=ja&gl=JP&ceid=JP:ja", 'JP'))
-        if ticker in ['URA', 'SOXL', 'CLS']:
+        if ticker in ['URA', 'SOXL', 'CLS', 'AMD']:
             urls.append((f"https://news.google.com/rss/search?q={term_eu}+after:{d_after}+before:{d_before}&hl=de&gl=DE&ceid=DE:de", 'EU_DE'))
 
         for url, region in urls:
             try:
                 feed = feedparser.parse(url)
-                for entry in feed.entries[:2]: # 每個節點取 2 條以節省資源，總量夠多
+                for entry in feed.entries[:2]: 
                     title = entry.title
                     pub_date = pd.to_datetime(entry.published).date() if hasattr(entry, 'published') else current.date()
-                    
-                    # 評分邏輯 (內嵌)
                     score = 0
                     if region in ['US', 'EU_UK']:
                         score = TextBlob(title).sentiment.polarity
@@ -89,209 +83,205 @@ def fetch_global_news_12m(ticker):
                     elif region == 'TW':
                         for k in MULTILINGUAL_DICT['ZH']['UP']: 
                             if k in title: score += 0.5
-                    # ... (其他語言省略以節省長度，邏輯同前)
+                    elif region == 'JP':
+                        for k in MULTILINGUAL_DICT['JA']['UP']: 
+                            if k in title: score += 0.5
+                    elif region == 'EU_DE':
+                        for k in MULTILINGUAL_DICT['DE']['UP']: 
+                            if k in title.lower(): score += 0.5
                     
                     if score != 0:
-                        news_history.append({
-                            'Ticker': ticker,
-                            'Date': pub_date,
-                            'Region': region,
-                            'Title': title,
-                            'Score': score
-                        })
+                        news_history.append({'Ticker': ticker, 'Date': pub_date, 'Region': region, 'Title': title, 'Score': score})
             except: pass
-        
         current = next_month
         time.sleep(0.05)
     
     return pd.DataFrame(news_history)
 
 # ==========================================
-# 2. 定價層：四維定價模型 (Quant Engine)
+# 2. 定價層：四維定價
 # ==========================================
 def train_rf_model(df, ticker):
-    """隨機森林預測 (來自 App 3.0)"""
     try:
         data = df[['Close']].copy()
         data['Ret'] = data['Close'].pct_change()
         data['Vol'] = data['Ret'].rolling(20).std()
         data['SMA'] = data['Close'].rolling(20).mean()
-        data['Target'] = data['Close'].shift(-30) # 預測30天後
+        data['Target'] = data['Close'].shift(-22) # 預測22天(一個月)後
         data = data.dropna()
-        
         if len(data) < 60: return None
-        
         X = data[['Ret', 'Vol', 'SMA']]
         y = data['Target']
-        
         model = RandomForestRegressor(n_estimators=100, random_state=42)
         model.fit(X, y)
-        
         last_row = data.iloc[[-1]][['Ret', 'Vol', 'SMA']]
         return model.predict(last_row)[0]
     except: return None
 
 def calc_4d_target(ticker, df_price):
-    """計算 ATR, RF, Fib, MC 四維目標價"""
     current = df_price['Close'].iloc[-1]
-    
-    # 1. ATR (物理極限)
     tr = df_price['High'] - df_price['Low']
     atr = tr.rolling(14).mean().iloc[-1]
-    t_atr = current + (atr * np.sqrt(30))
-    
-    # 2. Fibonacci (黃金分割)
+    t_atr = current + (atr * np.sqrt(22)) # 調整為22天
     recent = df_price['Close'].iloc[-60:]
     t_fib = recent.max() + (recent.max() - recent.min()) * 0.618
-    
-    # 3. Mean Reversion (慣性)
     mu = df_price['Close'].pct_change().mean()
-    t_mc = current * ((1 + mu) ** 30)
-    
-    # 4. Random Forest (AI)
+    t_mc = current * ((1 + mu) ** 22)
     t_rf = train_rf_model(df_price, ticker)
-    if t_rf is None: t_rf = t_mc # 備援
-    
-    # 綜合目標
+    if t_rf is None: t_rf = t_mc
     avg_target = (t_atr + t_fib + t_mc + t_rf) / 4
     return avg_target, {'ATR': t_atr, 'Fib': t_fib, 'MC': t_mc, 'RF': t_rf}
 
 # ==========================================
-# 3. 決策層：狙擊手邏輯 (Sniper Engine)
+# 3. 回測層：時光機驗證 (Historical Validation)
 # ==========================================
-def analyze_sniper(ticker, df_price, df_news_ticker):
-    # A. 處理新聞分數
-    news_score = 0
-    latest_news = "無新聞"
+def run_historical_validation(df_price, df_news_ticker):
+    """
+    對過去一年進行逐日回測
+    目標：預測 22 天後的漲跌 (Month-Over-Month)
+    """
+    df = df_price.copy()
+    
+    # 1. 準備新聞特徵 (歷史對齊)
     if not df_news_ticker.empty:
-        # 加權平均 (TW/JP/EU 權重較高)
         df_news_ticker['Weight'] = df_news_ticker['Region'].apply(lambda x: 1.2 if x != 'US' else 1.0)
         df_news_ticker['W_Score'] = df_news_ticker['Score'] * df_news_ticker['Weight']
-        
-        # 每日聚合
         daily_score = df_news_ticker.groupby('Date')['W_Score'].mean()
-        # 映射到股價日期
-        df_price = df_price.join(daily_score, how='left').fillna(0)
-        # 3日平滑
-        df_price['News_Factor'] = df_price['W_Score'].rolling(3).mean()
-        news_score = df_price['News_Factor'].iloc[-1]
+        df = df.join(daily_score, how='left').fillna(0)
+        df['News_Roll'] = df['W_Score'].rolling(3).mean()
+    else:
+        df['News_Roll'] = 0
         
-        latest = df_news_ticker.sort_values('Date').iloc[-1]
-        latest_news = f"[{latest['Region']}] {latest['Title']}"
+    # 2. 準備技術特徵 (歷史對齊)
+    df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+    df['OBV_Slope'] = df['OBV'].diff(5) # 5日 OBV 趨勢
     
-    # B. 計算 OBV (資金流)
-    df_price['OBV'] = (np.sign(df_price['Close'].diff()) * df_price['Volume']).fillna(0).cumsum()
-    obv_slope = (df_price['OBV'].iloc[-1] - df_price['OBV'].iloc[-5]) # 5日 OBV 趨勢
+    vol_mean = df['Volume'].rolling(20).mean()
+    vol_std = df['Volume'].rolling(20).std()
+    df['Vol_Z'] = (df['Volume'] - vol_mean) / (vol_std + 1e-9)
     
-    # C. 計算成交量 Z-Score
-    vol = df_price['Volume']
-    vol_mean = vol.rolling(20).mean()
-    vol_std = vol.rolling(20).std()
-    vol_z = (vol.iloc[-1] - vol_mean.iloc[-1]) / (vol_std.iloc[-1] + 1e-9)
+    # 3. 計算 Alpha Score (簡化版，為了回測速度)
+    # 結合: News + Tech(均線) + OBV
+    df['MA20'] = df['Close'].rolling(20).mean()
+    df['Score_Tech'] = np.where(df['Close'] > df['MA20'], 1, -1)
+    df['Alpha_Signal'] = (df['News_Roll'] * 0.4) + (df['Score_Tech'] * 0.4) + (np.sign(df['OBV_Slope']) * 0.2)
     
-    # D. 四維定價
+    # 4. 定義 "未來真實回報" (22天後)
+    df['Ret_1M'] = df['Close'].shift(-22) / df['Close'] - 1
+    
+    # --- 回測 A: 方向準確度 (Directional Accuracy) ---
+    # 預測看多(Alpha>0) 且 實際漲 > 0
+    valid_rows = df.dropna(subset=['Ret_1M'])
+    if len(valid_rows) > 0:
+        correct_dir = np.sign(valid_rows['Alpha_Signal']) == np.sign(valid_rows['Ret_1M'])
+        dir_acc = correct_dir.mean()
+    else:
+        dir_acc = 0.5
+        
+    # --- 回測 B: 狙擊手勝率 (Sniper Win Rate) ---
+    # 條件: News>0.1 & OBV>0 & Vol_Z>1.5
+    sniper_mask = (df['News_Roll'] > 0.1) & (df['OBV_Slope'] > 0) & (df['Vol_Z'] > 1.5)
+    sniper_opportunities = df[sniper_mask].dropna(subset=['Ret_1M'])
+    
+    if len(sniper_opportunities) > 0:
+        sniper_wins = sniper_opportunities[sniper_opportunities['Ret_1M'] > 0]
+        sniper_win_rate = len(sniper_wins) / len(sniper_opportunities)
+        sniper_count = len(sniper_opportunities)
+        avg_return = sniper_opportunities['Ret_1M'].mean()
+    else:
+        sniper_win_rate = 0.0
+        sniper_count = 0
+        avg_return = 0.0
+        
+    return dir_acc, sniper_win_rate, sniper_count, avg_return, df
+
+# ==========================================
+# 4. 決策層
+# ==========================================
+def analyze_sniper_full(ticker, df_price, df_news_ticker):
+    # 執行回測
+    dir_acc, sniper_rate, sniper_count, sniper_ret, df_processed = run_historical_validation(df_price, df_news_ticker)
+    
+    # 計算當下狀態
     target, details = calc_4d_target(ticker, df_price)
+    current_row = df_processed.iloc[-1]
     
-    # E. 狙擊判斷 (Sniper Logic)
+    # 狙擊判斷
     status = "⬜ 觀望"
     action = "Hold"
     
-    is_news_good = news_score > 0.1
-    is_fund_in = obv_slope > 0
-    is_vol_explode = vol_z > 1.5
+    is_news = current_row['News_Roll'] > 0.1
+    is_obv = current_row['OBV_Slope'] > 0
+    is_vol = current_row['Vol_Z'] > 1.5
     
-    if is_news_good and is_fund_in and is_vol_explode:
-        status = "🎯 狙擊點 (Sniper Entry)"
+    if is_news and is_obv and is_vol:
+        status = "🎯 狙擊訊號 (Sniper)"
         action = "Strong Buy"
-    elif is_news_good and not is_fund_in:
-        status = "⚠️ 假突破 (Fakeout)" # 新聞好但沒人買
+    elif is_news and not is_obv:
+        status = "⚠️ 假突破 (Fakeout)"
         action = "Avoid"
-    elif not is_news_good and is_fund_in:
-        status = "🥷 潛伏買盤 (Stealth)" # 沒新聞但有人買
+    elif not is_news and is_obv:
+        status = "🥷 潛伏 (Stealth)"
         action = "Buy"
-    elif news_score < -0.1 and obv_slope < 0:
-        status = "🔻 趨勢看跌"
-        action = "Sell"
         
+    latest_news = "無新聞"
+    if not df_news_ticker.empty:
+        latest = df_news_ticker.sort_values('Date').iloc[-1]
+        latest_news = f"[{latest['Region']}] {latest['Title']}"
+
     return {
         'Ticker': ticker,
-        'Current': df_price['Close'].iloc[-1],
-        'Target_4D': target,
-        'Upside': (target - df_price['Close'].iloc[-1]) / df_price['Close'].iloc[-1],
-        'News_Score': news_score,
-        'OBV_Trend': "流入" if obv_slope > 0 else "流出",
-        'Vol_Z': vol_z,
+        'Current': current_row['Close'],
+        'Target_1M': target,
+        'Upside': (target - current_row['Close']) / current_row['Close'],
+        'Dir_Acc': dir_acc,          # 回測指標 1
+        'Sniper_Win': sniper_rate,   # 回測指標 2
+        'Sniper_Count': sniper_count,# 樣本數
+        'Sniper_AvgRet': sniper_ret, # 平均獲利
         'Status': status,
         'Action': action,
-        'Latest_News': latest_news,
-        'Details': details
+        'Latest_News': latest_news
     }
 
 # ==========================================
-# 4. 主程式流程
+# 5. 主程式流程
 # ==========================================
-# Sidebar 模式選擇
-data_mode = st.sidebar.radio("數據來源模式", ["1. 讓程式抓取 (Live Fetch)", "2. 上傳已知新聞 (Upload CSV)"])
-
-# 資產清單
+st.sidebar.title("控制台")
+data_mode = st.sidebar.radio("數據來源", ["1. 即時爬取 (Live)", "2. 上傳 CSV"])
 default_tickers = ["TSM", "NVDA", "AMD", "SOXL", "URA", "CLS"]
-user_tickers = st.sidebar.text_area("輸入代號 (逗號分隔)", ", ".join(default_tickers))
+user_tickers = st.sidebar.text_area("代號", ", ".join(default_tickers))
 ticker_list = [t.strip().upper() for t in user_tickers.split(',')]
 
 news_df = pd.DataFrame()
-run_analysis = False
+run = False
 
-# --- 模式 1: 即時抓取 ---
 if data_mode.startswith("1"):
-    if st.sidebar.button("🚀 啟動爬蟲 & 分析"):
+    if st.sidebar.button("🚀 啟動回測"):
         all_news = []
-        progress = st.progress(0)
-        status = st.empty()
-        
+        bar = st.sidebar.progress(0)
         for i, t in enumerate(ticker_list):
-            status.text(f"正在爬取 {t} 過去 12 個月新聞...")
             df = fetch_global_news_12m(t)
-            if not df.empty:
-                all_news.append(df)
-            progress.progress((i+1)/len(ticker_list))
-            
+            if not df.empty: all_news.append(df)
+            bar.progress((i+1)/len(ticker_list))
         if all_news:
             news_df = pd.concat(all_news, ignore_index=True)
-            run_analysis = True
-        else:
-            st.error("抓不到任何新聞，請檢查連線。")
-
-# --- 模式 2: 上傳 CSV ---
+            run = True
 else:
-    uploaded_file = st.sidebar.file_uploader("上傳 news_data.csv", type=['csv'])
-    if uploaded_file:
-        news_df = pd.read_csv(uploaded_file)
+    up = st.sidebar.file_uploader("上傳 news.csv", type=['csv'])
+    if up:
+        news_df = pd.read_csv(up)
         news_df['Date'] = pd.to_datetime(news_df['Date'])
-        run_analysis = st.sidebar.button("🚀 執行分析")
+        run = st.sidebar.button("🚀 執行")
 
-# --- 分析與結果展示 ---
-if run_analysis and not news_df.empty:
-    st.success(f"數據就緒：共 {len(news_df)} 條新聞資料")
+if run:
+    # CSV 下載
+    st.sidebar.download_button("📥 下載本次新聞數據", news_df.to_csv(index=False).encode('utf-8'), "news_data.csv", "text/csv")
     
-    # 1. 提供 CSV 下載 (User Requirement)
-    csv = news_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 下載新聞資料 (news_data.csv)",
-        data=csv,
-        file_name='news_data.csv',
-        mime='text/csv',
-    )
-    
-    st.divider()
-    st.subheader("📊 狙擊手戰略報告")
+    st.subheader("📊 狙擊手戰略報告 (含 12 個月回測驗證)")
     
     results = []
-    progress = st.progress(0)
-    
-    for i, t in enumerate(ticker_list):
-        # 下載股價 (Quant Data)
+    for t in ticker_list:
         df_price = yf.download(t, period="2y", progress=False, auto_adjust=True)
-        # 處理 MultiIndex
         if isinstance(df_price.columns, pd.MultiIndex):
             temp = df_price['Close'][[t]].copy(); temp.columns = ['Close']
             temp['Volume'] = df_price['Volume'][t]
@@ -301,50 +291,47 @@ if run_analysis and not news_df.empty:
         else:
             df_price = df_price[['Close', 'Volume', 'High', 'Low']]
             
-        # 篩選該股票的新聞
-        df_news_t = news_df[news_df['Ticker'] == t].copy()
-        
-        # 執行狙擊手分析
-        res = analyze_sniper(t, df_price, df_news_t)
+        df_news_t = news_df[news_df['Ticker'] == t].copy() if not news_df.empty else pd.DataFrame()
+        res = analyze_sniper_full(t, df_price, df_news_t)
         results.append(res)
-        progress.progress((i+1)/len(ticker_list))
         
-    # 顯示結果
     res_df = pd.DataFrame(results)
     
-    # 格式化顯示
-    show_df = res_df.copy()
-    for c in ['Current', 'Target_4D']: show_df[c] = show_df[c].apply(lambda x: f"${x:.2f}")
-    show_df['Upside'] = show_df['Upside'].apply(lambda x: f"{x:+.1%}")
-    show_df['Vol_Z'] = show_df['Vol_Z'].apply(lambda x: f"{x:.1f}")
-    show_df['News_Score'] = show_df['News_Score'].apply(lambda x: f"{x:.2f}")
+    # 格式化
+    show = res_df.copy()
+    show['Dir_Acc'] = show['Dir_Acc'].apply(lambda x: f"{x:.0%}")
+    show['Sniper_Win'] = show['Sniper_Win'].apply(lambda x: f"{x:.0%}")
+    show['Sniper_AvgRet'] = show['Sniper_AvgRet'].apply(lambda x: f"{x:+.1%}")
+    for c in ['Current', 'Target_1M']: show[c] = show[c].apply(lambda x: f"${x:.2f}")
+    show['Upside'] = show['Upside'].apply(lambda x: f"{x:+.1%}")
     
-    # 重點欄位
-    cols = ['Ticker', 'Status', 'Action', 'Current', 'Target_4D', 'Upside', 'News_Score', 'OBV_Trend', 'Vol_Z', 'Latest_News']
-    st.dataframe(show_df[cols].style.map(
-        lambda x: 'background-color: #00FF7F; color: black' if '狙擊點' in str(x) else ('background-color: #FF4B4B; color: white' if '假突破' in str(x) else ''),
-        subset=['Status']
+    # 顯示主表
+    st.dataframe(show[['Ticker', 'Status', 'Action', 'Dir_Acc', 'Sniper_Win', 'Sniper_Count', 'Sniper_AvgRet', 'Current', 'Target_1M', 'Latest_News']].style.map(
+        lambda x: 'background-color: #00FF7F; color: black' if '狙擊' in str(x) else '', subset=['Status']
     ))
     
-    # 氣泡圖：Z-Score (X) vs News Score (Y)
+    # 驗證散佈圖
     fig = go.Figure()
     for i, row in res_df.iterrows():
-        color = '#00FF7F' if '狙擊' in row['Status'] else ('#FF4B4B' if '假' in row['Status'] else 'gray')
+        # X軸: 方向準確度 (代表模型多懂這支股票)
+        # Y軸: 狙擊勝率 (代表爆發訊號多準)
+        size = np.log(row['Sniper_Count'] + 1) * 15 # 樣本數越多泡泡越大
+        color = '#00FF7F' if row['Sniper_Win'] > 0.6 else '#FF4B4B'
+        
         fig.add_trace(go.Scatter(
-            x=[row['Vol_Z']], y=[row['News_Score']],
+            x=[row['Dir_Acc']], y=[row['Sniper_Win']],
             mode='markers+text', text=[row['Ticker']],
-            textposition="top center", marker=dict(size=30, color=color),
+            textposition="top center", marker=dict(size=size, color=color),
             name=row['Ticker'],
-            hovertemplate="<b>%{text}</b><br>News: %{y:.2f}<br>Vol Z: %{x:.1f}<br>Status: " + row['Status']
+            hovertemplate="<b>%{text}</b><br>方向準確度: %{x:.0%}<br>狙擊勝率: %{y:.0%}<br>樣本數: " + str(row['Sniper_Count'])
         ))
         
-    fig.add_hline(y=0, line_dash="dash", line_color="white")
-    fig.add_vline(x=1.5, line_dash="dash", line_color="yellow", annotation_text="爆量門檻")
-    
+    fig.add_hline(y=0.5, line_dash="dash", line_color="gray")
+    fig.add_vline(x=0.5, line_dash="dash", line_color="gray")
     fig.update_layout(
-        title="<b>狙擊手雷達</b> (右上角=最佳買點)",
-        xaxis_title="成交量異常值 (Vol Z-Score)",
-        yaxis_title="新聞情緒分數 (News Score)",
+        title="<b>模型可信度矩陣</b> (右上角=聖杯區)",
+        xaxis_title="長期方向準確度 (12M)",
+        yaxis_title="狙擊訊號勝率 (1M return > 0)",
         template="plotly_dark", height=500
     )
     st.plotly_chart(fig, use_container_width=True)
