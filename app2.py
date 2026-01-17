@@ -5,12 +5,11 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import os
 import plotly.graph_objects as go
-from sklearn.ensemble import RandomForestRegressor
 
 # ==========================================
 # 0. 頁面設定
 # ==========================================
-st.set_page_config(page_title="App 19.0 全景指揮官 (誤差校正版)", layout="wide")
+st.set_page_config(page_title="App 21.0 十年全景指揮官", layout="wide")
 LOCAL_NEWS_FILE = "news_data_local.csv"
 
 if 'news_data' not in st.session_state:
@@ -23,239 +22,196 @@ if 'news_data' not in st.session_state:
         except: st.session_state['news_data'] = pd.DataFrame()
     else: st.session_state['news_data'] = pd.DataFrame()
 
-st.title("🦅 App 19.0: 全景指揮官 (真實誤差校正版)")
+st.title("🦅 App 21.0: 十年全景指揮官 (Decade-Scale Probability)")
 st.markdown("""
-**新增維度：**
-1.  **方向準確度 (Dir_Acc)**：模型判斷漲跌的長期勝率。
-2.  **預測誤差 (MAPE)**：回測過去每一天的「預測價 vs 真實價」，計算平均誤差率。
+**數據升級：**
+* **時間跨度**：從 2 年擴展到 **10 年 (2015-2025)**。
+* **包含週期**：涵蓋 2022 升息崩盤、2020 熔斷、2018 貿易戰。
+* **目的**：讓模型學會「熊市」的樣子，避免在牛市末期過度樂觀。
 """)
 
 # ==========================================
-# 1. 核心工具
+# 1. 核心工具：10年宏觀數據
 # ==========================================
 @st.cache_data(ttl=3600*4)
-def fetch_market_vitals():
+def fetch_long_term_data(tickers, period="10y"):
     try:
-        data = yf.download(['SPY', '^VIX'], period="2y", progress=False)['Close']
-        if isinstance(data, pd.DataFrame) and 'SPY' in data.columns:
-            spy = data['SPY']
-            vix = data['^VIX']
-        else: return pd.DataFrame(), pd.Series(), pd.Series()
-
-        spy_ma200 = spy.rolling(200).mean()
-        cond_green = (spy > spy_ma200) & (vix < 25)
-        cond_red = (spy < spy_ma200) & (vix > 30)
-        
-        vitals = pd.DataFrame(index=data.index)
-        vitals['Green'] = cond_green
-        vitals['Red'] = cond_red
-        vitals['Yellow'] = (~cond_green) & (~cond_red)
-        return vitals, spy, vix
-    except: return pd.DataFrame(), pd.Series(), pd.Series()
-
-def calculate_vwap(df, window=20):
-    v = df['Volume']
-    tp = (df['High'] + df['Low'] + df['Close']) / 3
-    return (tp * v).rolling(window).sum() / v.rolling(window).sum()
+        data = yf.download(tickers, period=period, progress=False)['Close']
+        return data
+    except: return pd.DataFrame()
 
 # ==========================================
-# 2. 歷史誤差回測引擎 (Historical Error Engine)
+# 2. 歷史機率引擎 (10年版)
 # ==========================================
-def calc_rolling_forecast_stats(df, days=30):
-    """
-    計算過去每一天的預測值，並與 N 天後的真實股價比較
-    """
-    d = df.copy()
-    
-    # 1. 建立滾動特徵 (模擬當時能看到的數據)
-    # ATR Target
-    tr = d['High'] - d['Low']
-    atr = tr.rolling(14).mean()
-    d['Target_ATR'] = d['Close'] + (atr * np.sqrt(days))
-    
-    # Fibonacci Target (Rolling Max)
-    roll_max = d['Close'].rolling(60).max()
-    roll_min = d['Close'].rolling(60).min()
-    d['Target_Fib'] = roll_max + (roll_max - roll_min) * 0.618
-    
-    # Monte Carlo (Simple Drift)
-    # 這裡用簡單的 20日平均漲幅推算
-    avg_ret = d['Close'].pct_change().rolling(60).mean()
-    d['Target_MC'] = d['Close'] * ((1 + avg_ret) ** days)
-    
-    # 綜合預測 (歷史回測不跑 RF 以免超時，僅用統計模型)
-    d['Pred_Price'] = (d['Target_ATR'] * 0.3) + (d['Target_Fib'] * 0.3) + (d['Target_MC'] * 0.4)
-    
-    # 2. 對答案 (Future Close)
-    d['Actual_Future'] = d['Close'].shift(-days)
-    
-    # 3. 計算誤差
-    # Error % = |Pred - Actual| / Actual
-    d['Error_Pct'] = (d['Pred_Price'] - d['Actual_Future']).abs() / d['Actual_Future']
-    
-    # 排除還沒發生未來的資料
-    valid = d.dropna(subset=['Actual_Future', 'Error_Pct'])
-    
-    if len(valid) == 0: return 0.0, 0.0
-    
-    mape = valid['Error_Pct'].mean() # 平均誤差
-    last_pred = d['Pred_Price'].iloc[-1] # 最新的預測值
-    
-    return mape, last_pred
-
-# ==========================================
-# 3. 綜合回測 (Smart DCA + Dir_Acc)
-# ==========================================
-def run_comprehensive_backtest(ticker, df_price, df_news, vitals):
+def analyze_decade_probability(ticker, df_price, lookahead=30):
     df = df_price.copy()
     
-    # --- A. 數據整合 ---
-    if not df_news.empty:
-        if not pd.api.types.is_datetime64_any_dtype(df_news['Date']):
-             df_news['Date'] = pd.to_datetime(df_news['Date'])
-        daily_score = df_news.groupby('Date')['Score'].mean()
-        df = df.join(daily_score, how='left').fillna(0)
-        df['News_Roll'] = df['Score'].rolling(3).mean()
-    else: df['News_Roll'] = 0
-        
-    vitals_aligned = vitals.reindex(df.index).ffill().fillna(False)
-    df = df.join(vitals_aligned)
+    # 1. 定義狀態 (與 App 20.0 相同，但樣本變多)
+    # A. 趨勢: Price vs MA200 (牛熊分界線)
+    df['MA200'] = df['Close'].rolling(200).mean()
+    df['Trend'] = np.where(df['Close'] > df['MA200'], 'Bull', 'Bear')
     
+    # B. 乖離: Price vs MA60 (中期乖離)
     df['MA60'] = df['Close'].rolling(60).mean()
-    df['VWAP'] = calculate_vwap(df, 20)
-    df['Dev_VWAP'] = (df['Close'] - df['VWAP']) / df['VWAP']
+    df['Bias_60'] = (df['Close'] - df['MA60']) / df['MA60']
     
-    # --- B. 方向準確度 (Dir_Acc) ---
-    # 預測 N 天後漲跌
-    df['Ret_30D'] = df['Close'].shift(-30) / df['Close'] - 1
+    # 定義乖離狀態
+    # 這裡用統計分位數 (Quantile) 來定義何謂「過熱」
+    # 因為 10 年的數據分佈比較準
+    bias_high = df['Bias_60'].quantile(0.8) # 前 20% 高
+    bias_low = df['Bias_60'].quantile(0.2)  # 前 20% 低
     
-    # 簡單 Alpha 模型: News + Trend + VWAP
-    # 如果新聞好 且 趨勢向上 且 在 VWAP 之上 -> 看多
-    df['Alpha_Score'] = (df['News_Roll'] * 0.3) + (np.where(df['Close']>df['MA60'], 1, -1) * 0.4) + (np.where(df['Dev_VWAP']>0, 1, -1) * 0.3)
+    conditions = [
+        (df['Bias_60'] > bias_high),
+        (df['Bias_60'] < bias_low),
+        (df['Bias_60'] >= bias_low) & (df['Bias_60'] <= bias_high)
+    ]
+    choices = ['Overheated', 'Oversold', 'Normal']
+    df['Bias_State'] = np.select(conditions, choices, default='Normal')
     
-    valid_dir = df.dropna(subset=['Ret_30D'])
-    if len(valid_dir) > 0:
-        # 同號相乘 > 0 代表方向預測正確
-        correct = (valid_dir['Alpha_Score'] * valid_dir['Ret_30D']) > 0
-        dir_acc = correct.mean()
-    else: dir_acc = 0.5
+    # C. 波動率狀態 (VIX Proxy)
+    # 用自身的波動率替代 VIX (因為個股股性不同)
+    df['Vol_20'] = df['Close'].pct_change().rolling(20).std()
+    vol_high = df['Vol_20'].quantile(0.7)
+    df['Vol_State'] = np.where(df['Vol_20'] > vol_high, 'High_Vol', 'Low_Vol')
     
-    # --- C. Smart DCA 回測 ---
-    # 策略: 黃燈時才啟用智能 (趨勢向上+回調)，綠燈無腦買，紅燈不買
-    cash = 10000.0; shares = 0.0; dca_shares = 0.0
-    total_inv = 10000.0
-    last_month = -1
-    start_idx = 200
+    # 組合簽名
+    df['Signature'] = df['Trend'] + "_" + df['Bias_State'] + "_" + df['Vol_State']
     
-    cond_smart = (df['Close'] > df['MA60']) & (df['Dev_VWAP'].abs() < 0.05)
+    # 2. 計算未來回報
+    df['Future_Ret'] = df['Close'].shift(-lookahead) / df['Close'] - 1
     
-    for i in range(start_idx, len(df)):
-        price = df['Close'].iloc[i]
-        date = df.index[i]
+    # 3. 獲取當前狀態
+    current_sig = df['Signature'].iloc[-1]
+    
+    # 4. 歷史搜尋 (10年數據)
+    # 排除最近 30 天
+    history = df.iloc[:-lookahead]
+    matches = history[history['Signature'] == current_sig]
+    
+    # 5. 統計
+    if len(matches) < 5: # 樣本不足，放寬條件
+        fallback_sig = df['Trend'].iloc[-1] + "_" + df['Bias_State'].iloc[-1]
+        df['Simple_Sig'] = df['Trend'] + "_" + df['Bias_State']
+        matches = history[history['Simple_Sig'] == fallback_sig]
+        note = "模糊比對 (10年樣本仍少)"
+    else:
+        note = "精確比對"
         
-        is_green = df['Green'].iloc[i] if 'Green' in df.columns else True
-        is_yellow = df['Yellow'].iloc[i] if 'Yellow' in df.columns else False
+    if len(matches) > 0:
+        win_rate = len(matches[matches['Future_Ret'] > 0]) / len(matches)
+        exp_ret = matches['Future_Ret'].mean()
+        avg_loss = matches[matches['Future_Ret'] < 0]['Future_Ret'].mean() if len(matches[matches['Future_Ret'] < 0]) > 0 else 0
         
-        if date.month != last_month:
-            if last_month != -1:
-                income = 10000.0
-                total_inv += income
-                cash += income
-                dca_shares += income / price
-            last_month = date.month
-            
-        if is_green: # 綠燈無腦買
-            if cash > 0:
-                shares += cash / price
-                cash = 0
-        elif is_yellow: # 黃燈智能買
-            if cash > 0 and cond_smart.iloc[i]:
-                shares += cash / price
-                cash = 0
-                
-    val_smart = cash + shares * df['Close'].iloc[-1]
-    val_dca = dca_shares * df['Close'].iloc[-1]
-    
-    roi_smart = (val_smart - total_inv) / total_inv
-    roi_dca = (val_dca - total_inv) / total_inv
-    
-    return dir_acc, roi_smart, roi_dca
+        # 預測價格
+        pred_price = df['Close'].iloc[-1] * (1 + exp_ret)
+    else:
+        win_rate = 0.5; exp_ret = 0.0; pred_price = df['Close'].iloc[-1]
+        avg_loss = 0.0; note = "無歷史樣本"
+        
+    return {
+        'State': current_sig,
+        'Count': len(matches),
+        'Note': note,
+        'Win_Rate': win_rate,
+        'Exp_Return': exp_ret,
+        'Avg_Loss': avg_loss,
+        'Pred_Price': pred_price,
+        'Current_Bias': df['Bias_60'].iloc[-1],
+        'High_Bias_Threshold': bias_high
+    }
 
 # ==========================================
-# 4. 主程式
+# 3. 主程式
 # ==========================================
 st.sidebar.title("控制台")
-default_tickers = ["TSM", "NVDA", "AMD", "SOXL", "URA", "0050.TW"]
+default_tickers = ["TSM", "NVDA", "AMD", "SOXL", "URA", "0050.TW", "SPY"]
 user_tickers = st.sidebar.text_area("代號", ", ".join(default_tickers))
 ticker_list = [t.strip().upper() for t in user_tickers.split(',')]
 
-vitals_df, _, _ = fetch_market_vitals()
-if not vitals_df.empty:
-    last = vitals_df.iloc[-1]
-    status = "🟢 牛市健康" if last['Green'] else ("🔴 牛市休克" if last['Red'] else "🟡 牛市回檔")
-    st.subheader(f"🏥 市場生命徵象: {status}")
-    st.divider()
+st.info("💡 資料庫已切換為 **10年期 (2015-2025)**。這能捕捉到 2022 熊市與 2020 崩盤的特徵，讓預測更保守且真實。")
 
-if st.button("🚀 執行全維度分析"):
-    st.subheader("📊 全景分析報告")
+if st.button("🚀 執行十年機率預測"):
     results = []
     
-    news_df = st.session_state.get('news_data', pd.DataFrame())
-    
     for t in ticker_list:
-        df_price = yf.download(t, period="2y", progress=False, auto_adjust=True)
+        # 下載 10 年數據
+        df_price = yf.download(t, period="10y", progress=False, auto_adjust=True)
         if isinstance(df_price.columns, pd.MultiIndex):
             temp = df_price['Close'][[t]].copy(); temp.columns = ['Close']
-            temp['Volume'] = df_price['Volume'][t]
-            temp['High'] = df_price['High'][t]
-            temp['Low'] = df_price['Low'][t]
             df_price = temp
         else:
-            df_price = df_price[['Close', 'Volume', 'High', 'Low']]
+            df_price = df_price[['Close']]
             
-        df_news_t = news_df[news_df['Ticker'] == t].copy() if not news_df.empty else pd.DataFrame()
+        if len(df_price) < 250: # 新股保護
+            st.warning(f"{t} 上市時間不足 10 年，將使用現有數據。")
+            
+        # 執行分析
+        data = analyze_decade_probability(t, df_price, lookahead=30)
         
-        # 1. 執行綜合回測 (Dir_Acc, ROI)
-        dir_acc, roi_smart, roi_dca = run_comprehensive_backtest(t, df_price, df_news_t, vitals_df)
-        
-        # 2. 執行誤差回測 (Forecast Error)
-        mape, pred_price = calc_rolling_forecast_stats(df_price, days=30)
-        
-        current = df_price['Close'].iloc[-1]
-        upside = (pred_price - current) / current
-        
-        # 3. 判斷模型可靠度
-        reliability = "高"
-        if dir_acc < 0.5 or mape > 0.2: reliability = "低 (誤差大)"
-        elif dir_acc < 0.6: reliability = "中"
-        
+        # 判斷方向
+        if data['Win_Rate'] > 0.6: 
+            direction = "↗️ 看漲"
+            color = "#00FF7F"
+        elif data['Win_Rate'] < 0.4: 
+            direction = "↘️ 看跌"
+            color = "#FF4B4B"
+        else: 
+            direction = "➡️ 震盪"
+            color = "gray"
+            
+        # 判斷是否過熱 (跟自己的 10 年歷史比)
+        bias_status = "正常"
+        if data['Current_Bias'] > data['High_Bias_Threshold']:
+            bias_status = "⚠️ 歷史高點過熱"
+        elif data['Current_Bias'] < -0.1: # 簡單定義
+            bias_status = "🥶 歷史低檔"
+            
         results.append({
             'Ticker': t,
-            'Dir_Acc': dir_acc,       # 方向準度
-            'MAPE': mape,             # 價格誤差
-            'Reliability': reliability,
-            'Current': current,
-            'Pred_30D': pred_price,
-            'Upside': upside,
-            'Smart_ROI': roi_smart,
-            'DCA_ROI': roi_dca
+            'Current': df_price['Close'].iloc[-1],
+            'Pred_30D': data['Pred_Price'],
+            'Direction': direction,
+            'Win_Rate': data['Win_Rate'],
+            'Exp_Ret': data['Exp_Return'],
+            'Max_Risk': data['Avg_Loss'],
+            'State': data['State'],
+            'Bias_Status': bias_status,
+            'Samples': data['Count']
         })
         
+        # Expander
+        with st.expander(f"{t}: {direction} (勝率 {data['Win_Rate']:.0%}) | {bias_status}"):
+            c1, c2 = st.columns(2)
+            c1.markdown("#### 當前狀態 (10年尺度)")
+            c1.write(f"狀態簽名: `{data['State']}`")
+            c1.write(f"歷史出現次數: {data['Count']} 次 ({data['Note']})")
+            c1.metric("乖離水位", f"{data['Current_Bias']:.1%}", f"歷史高標: {data['High_Bias_Threshold']:.1%}")
+            
+            c2.markdown("#### 30天後劇本")
+            c2.write(f"期望回報: **{data['Exp_Return']:+.1%}**")
+            c2.write(f"平均下行風險: **{data['Avg_Loss']:.1%}**")
+            
+            # Gauge Chart
+            fig = go.Figure(go.Indicator(
+                mode = "gauge+number",
+                value = data['Win_Rate'] * 100,
+                title = {'text': "10年歷史勝率"},
+                gauge = {'axis': {'range': [0, 100]}, 'bar': {'color': color}}
+            ))
+            fig.update_layout(height=200, margin=dict(l=20,r=20,t=30,b=20))
+            st.plotly_chart(fig, use_container_width=True)
+
     res_df = pd.DataFrame(results)
     
-    # 顯示
+    st.markdown("### 🏆 十年全景報告")
     show = res_df.copy()
-    show['Dir_Acc'] = show['Dir_Acc'].apply(lambda x: f"{x:.0%}")
-    show['MAPE'] = show['MAPE'].apply(lambda x: f"±{x:.1%}")
     show['Current'] = show['Current'].apply(lambda x: f"${x:.2f}")
     show['Pred_30D'] = show['Pred_30D'].apply(lambda x: f"${x:.2f}")
-    show['Upside'] = show['Upside'].apply(lambda x: f"{x:+.1%}")
-    show['Smart_ROI'] = show['Smart_ROI'].apply(lambda x: f"{x:+.1%}")
-    show['DCA_ROI'] = show['DCA_ROI'].apply(lambda x: f"{x:+.1%}")
+    show['Win_Rate'] = show['Win_Rate'].apply(lambda x: f"{x:.0%}")
+    show['Exp_Ret'] = show['Exp_Ret'].apply(lambda x: f"{x:+.1%}")
     
-    st.dataframe(show.style.map(
-        lambda x: 'background-color: #00FF7F; color: black' if '高' in str(x) else ('background-color: #FF4B4B; color: white' if '低' in str(x) else ''), 
-        subset=['Reliability']
+    st.dataframe(show[['Ticker', 'Direction', 'Win_Rate', 'Exp_Ret', 'Current', 'Pred_30D', 'Bias_Status', 'Samples']].style.map(
+        lambda x: 'color: #FF4B4B' if '過熱' in str(x) or '看跌' in str(x) else ('color: #00FF7F' if '看漲' in str(x) else ''),
+        subset=['Direction', 'Bias_Status']
     ))
-    
-    st.info("💡 MAPE (平均誤差)：代表預測目標價的偏離程度。若 MAPE 為 ±10%，且預測漲 20%，則實際漲幅可能落在 10%~30% 之間。")
