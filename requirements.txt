@@ -8,3 +8,6 @@ scikit-learn
 requests
 xgboost
 tabulate
+feedparser
+textblob
+scipy
