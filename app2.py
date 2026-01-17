@@ -14,44 +14,40 @@ from sklearn.ensemble import RandomForestRegressor
 # ==========================================
 # 0. 頁面設定
 # ==========================================
-st.set_page_config(page_title="App 10.1 天眼指揮官 (修正版)", layout="wide")
+st.set_page_config(page_title="App 10.3 天眼指揮官 (最終穩定版)", layout="wide")
 
-st.title("🦅 App 10.1: 天眼指揮官 (Macro + 雙重回測 + 數據保全)")
+st.title("🦅 App 10.3: 天眼指揮官 (Macro + 雙重回測 + 穩定修復)")
 st.markdown("""
-**功能修復：**
-1.  **方向回測歸來**：恢復 `Dir_Acc` (方向準確度) 指標，檢驗模型長期判斷力。
-2.  **數據強制存檔**：爬蟲結束後立刻提供下載按鈕，避免重複抓取。
-3.  **天眼濾網**：結合 DXY/TNX/HYG 宏觀指標，只在順風時出擊。
+**修復報告：**
+1.  **解決 TypeError**：修正 `np.sign` 與空值 (NaN) 衝突導致的崩潰，改用「積數判斷法」計算準確度。
+2.  **完整功能**：包含天眼 (Macro)、新聞爬蟲、以及數據保全功能。
 """)
 
 # ==========================================
-# 1. 天眼系統：總體環境掃描
+# 1. 天眼系統 (Macro)
 # ==========================================
 @st.cache_data(ttl=3600*4)
 def fetch_macro_context():
     tickers = ['DX-Y.NYB', '^TNX', 'HYG', '^VIX']
     data = yf.download(tickers, period="1y", progress=False)['Close']
     
-    # 判斷趨勢
+    # 趨勢判斷
     dxy = data['DX-Y.NYB']
-    dxy_ma20 = dxy.rolling(20).mean().iloc[-1]
-    dxy_trend = "⬆️ 強勢(不利)" if dxy.iloc[-1] > dxy_ma20 else "⬇️ 弱勢(有利)"
+    dxy_trend = "⬆️ 強勢" if dxy.iloc[-1] > dxy.rolling(20).mean().iloc[-1] else "⬇️ 弱勢"
     
     tnx = data['^TNX']
-    tnx_ma20 = tnx.rolling(20).mean().iloc[-1]
-    tnx_trend = "⬆️ 升息(不利)" if tnx.iloc[-1] > tnx_ma20 else "⬇️ 降息(有利)"
+    tnx_trend = "⬆️ 升息" if tnx.iloc[-1] > tnx.rolling(20).mean().iloc[-1] else "⬇️ 降息"
     
     hyg = data['HYG']
-    hyg_ma20 = hyg.rolling(20).mean().iloc[-1]
-    risk_appetite = "🦁 Risk-On" if hyg.iloc[-1] > hyg_ma20 else "🐻 Risk-Off"
+    risk_appetite = "🦁 Risk-On" if hyg.iloc[-1] > hyg.rolling(20).mean().iloc[-1] else "🐻 Risk-Off"
     
     vix = data['^VIX'].iloc[-1]
     
-    # 評分 (滿分4分)
+    # 評分
     score = 0
-    if dxy.iloc[-1] < dxy_ma20: score += 1
-    if tnx.iloc[-1] < tnx_ma20: score += 1
-    if hyg.iloc[-1] > hyg_ma20: score += 1
+    if dxy.iloc[-1] < dxy.rolling(20).mean().iloc[-1]: score += 1
+    if tnx.iloc[-1] < tnx.rolling(20).mean().iloc[-1]: score += 1
+    if hyg.iloc[-1] > hyg.rolling(20).mean().iloc[-1]: score += 1
     if vix < 20: score += 1
     
     regime = "🟢 綠燈 (積極)" if score >= 3 else ("🟡 黃燈 (謹慎)" if score == 2 else "🔴 紅燈 (現金)")
@@ -59,7 +55,7 @@ def fetch_macro_context():
     return {'Regime': regime, 'Score': score, 'DXY': dxy_trend, 'TNX': tnx_trend, 'HYG': risk_appetite, 'Raw': data}
 
 # ==========================================
-# 2. 新聞爬蟲 (四國核心)
+# 2. 新聞爬蟲
 # ==========================================
 TICKER_MAP = {
     'TSM': {'TW': '台積電', 'JP': 'TSMC', 'EU': 'TSMC'},
@@ -83,6 +79,7 @@ def fetch_global_news_12m(ticker):
     start_date = end_date - relativedelta(months=12) 
     map_info = TICKER_MAP.get(ticker, {})
     term_us = f"{ticker}+stock" if len(ticker) <= 4 else ticker
+    
     term_tw = urllib.parse.quote(map_info.get('TW', ticker))
     term_jp = urllib.parse.quote(map_info.get('JP', ticker))
     term_eu = urllib.parse.quote(map_info.get('EU', ticker))
@@ -131,7 +128,7 @@ def fetch_global_news_12m(ticker):
     return pd.DataFrame(news_history)
 
 # ==========================================
-# 3. 定價層 (Quant Engine)
+# 3. 定價層
 # ==========================================
 def train_rf_model(df, ticker):
     try:
@@ -165,13 +162,16 @@ def calc_4d_target(ticker, df_price):
     return avg_target, {'ATR': t_atr, 'Fib': t_fib, 'MC': t_mc, 'RF': t_rf}
 
 # ==========================================
-# 4. 回測層：雙重驗證 (Dir_Acc + Sniper)
+# 4. 回測層 (關鍵修正)
 # ==========================================
 def run_historical_validation(df_price, df_news_ticker, macro_data):
     df = df_price.copy()
     
-    # A. 整合新聞
+    # A. 新聞對齊
     if not df_news_ticker.empty:
+        if not pd.api.types.is_datetime64_any_dtype(df_news_ticker['Date']):
+             df_news_ticker['Date'] = pd.to_datetime(df_news_ticker['Date'])
+
         df_news_ticker['Weight'] = df_news_ticker['Region'].apply(lambda x: 1.2 if x != 'US' else 1.0)
         df_news_ticker['W_Score'] = df_news_ticker['Score'] * df_news_ticker['Weight']
         daily_score = df_news_ticker.groupby('Date')['W_Score'].mean()
@@ -180,13 +180,13 @@ def run_historical_validation(df_price, df_news_ticker, macro_data):
     else:
         df['News_Roll'] = 0
         
-    # B. 整合宏觀 (Macro Risk-On/Off)
+    # B. 宏觀對齊
     macro_aligned = macro_data.reindex(df.index).ffill()
     macro_aligned['HYG_MA'] = macro_aligned['HYG'].rolling(20).mean()
     macro_aligned['Risk_On'] = macro_aligned['HYG'] > macro_aligned['HYG_MA']
     df = df.join(macro_aligned[['Risk_On']], how='left').fillna(False)
     
-    # C. 技術特徵
+    # C. 技術指標
     df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
     df['OBV_Slope'] = df['OBV'].diff(5)
     df['MA20'] = df['Close'].rolling(20).mean()
@@ -194,25 +194,30 @@ def run_historical_validation(df_price, df_news_ticker, macro_data):
     vol_std = df['Volume'].rolling(20).std()
     df['Vol_Z'] = (df['Volume'] - vol_mean) / (vol_std + 1e-9)
     
-    # D. 未來回報 (22天後)
+    # D. 目標變數 (22天後漲跌)
     df['Ret_1M'] = df['Close'].shift(-22) / df['Close'] - 1
     
-    # --- 指標 1: 方向準確度 (Dir_Acc) ---
-    # 邏輯: 綜合分數 (News + Tech) 是否預測對了漲跌?
-    df['Alpha_Raw'] = (df['News_Roll'] * 0.4) + (np.sign(df['OBV_Slope']) * 0.3) + (np.where(df['Close']>df['MA20'], 1, -1) * 0.3)
-    valid_rows = df.dropna(subset=['Ret_1M'])
+    # E. Alpha 訊號計算
+    # 技術得分: 收盤 > 均線 = 1, 否則 -1
+    tech_score = np.where(df['Close'] > df['MA20'], 1, -1)
+    obv_score = np.sign(df['OBV_Slope']).fillna(0) # 修正: 填補 NaN
+    
+    df['Alpha_Raw'] = (df['News_Roll'] * 0.4) + (obv_score * 0.3) + (tech_score * 0.3)
+    
+    # --- 關鍵修正區：穩定計算方向準確度 ---
+    # 1. 移除 NaN (前幾筆沒有 OBV 或是後幾筆沒有 Ret_1M 的)
+    valid_rows = df.dropna(subset=['Ret_1M', 'Alpha_Raw'])
     
     if len(valid_rows) > 0:
-        # 同號即為預測正確
-        correct = np.sign(valid_rows['Alpha_Raw']) == np.sign(valid_rows['Ret_1M'])
+        # 2. 不用 np.sign 比較，改用「相乘 > 0」邏輯 (同號相乘為正)
+        # 避免浮點數與 NaN 的問題
+        correct = (valid_rows['Alpha_Raw'] * valid_rows['Ret_1M']) > 0
         dir_acc = correct.mean()
     else:
         dir_acc = 0.5
     
-    # --- 指標 2: 天眼狙擊勝率 (Sniper Win Rate) ---
-    # 條件: News>0.1 & OBV>0 & Vol>1.5 & Risk_On (宏觀綠燈)
+    # --- Sniper Win Rate ---
     sniper_mask = (df['News_Roll'] > 0.1) & (df['OBV_Slope'] > 0) & (df['Vol_Z'] > 1.5) & (df['Risk_On'] == True)
-    
     sniper_opps = df[sniper_mask].dropna(subset=['Ret_1M'])
     
     if len(sniper_opps) > 0:
@@ -233,17 +238,17 @@ def run_historical_validation(df_price, df_news_ticker, macro_data):
 st.sidebar.title("控制台")
 data_mode = st.sidebar.radio("數據來源", ["1. 即時爬取 (Live)", "2. 上傳 CSV"])
 default_tickers = ["TSM", "NVDA", "AMD", "SOXL", "URA", "CLS"]
-user_tickers = st.sidebar.text_area("代號 (逗號分隔)", ", ".join(default_tickers))
+user_tickers = st.sidebar.text_area("代號", ", ".join(default_tickers))
 ticker_list = [t.strip().upper() for t in user_tickers.split(',')]
 
-# 宏觀儀表板
+# Macro
 macro_info = fetch_macro_context()
 st.subheader(f"🌍 天眼環境掃描: {macro_info['Regime']} (分數: {macro_info['Score']}/4)")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("美元 (DXY)", macro_info['DXY'])
-c2.metric("殖利率 (TNX)", macro_info['TNX'])
-c3.metric("風險胃納 (HYG)", macro_info['HYG'])
-c4.metric("宏觀建議", "積極進場" if macro_info['Score']>=3 else "保守操作")
+c1.metric("美元", macro_info['DXY'])
+c2.metric("利率", macro_info['TNX'])
+c3.metric("風險", macro_info['HYG'])
+c4.metric("建議", "積極" if macro_info['Score']>=3 else "保守")
 st.divider()
 
 news_df = pd.DataFrame()
@@ -263,26 +268,24 @@ if data_mode.startswith("1"):
 else:
     up = st.sidebar.file_uploader("上傳 news_data.csv", type=['csv'])
     if up:
-        news_df = pd.read_csv(up)
-        news_df['Date'] = pd.to_datetime(news_df['Date'])
-        run = st.sidebar.button("🚀 執行分析")
+        try:
+            temp = pd.read_csv(up)
+            if 'Date' in temp.columns and 'Score' in temp.columns:
+                news_df = temp
+                news_df['Date'] = pd.to_datetime(news_df['Date'])
+                run = st.sidebar.button("🚀 執行")
+            else:
+                st.error("❌ 檔案格式錯誤，請確認包含 Date, Score 欄位")
+        except: st.error("讀檔失敗")
 
 if run:
-    # 1. 強制存檔按鈕 (放在最顯眼處)
     st.sidebar.markdown("### 💾 數據保全")
-    st.sidebar.download_button(
-        "📥 下載新聞資料 (CSV)",
-        news_df.to_csv(index=False).encode('utf-8'),
-        "news_data.csv",
-        "text/csv",
-        key='download-csv'
-    )
+    st.sidebar.download_button("📥 下載新聞 CSV", news_df.to_csv(index=False).encode('utf-8'), "news_data.csv")
     
     st.subheader("📊 天眼戰略報告")
     results = []
     
     for t in ticker_list:
-        # 下載個股數據
         df_price = yf.download(t, period="2y", progress=False, auto_adjust=True)
         if isinstance(df_price.columns, pd.MultiIndex):
             temp = df_price['Close'][[t]].copy(); temp.columns = ['Close']
@@ -295,29 +298,25 @@ if run:
             
         df_news_t = news_df[news_df['Ticker'] == t].copy() if not news_df.empty else pd.DataFrame()
         
-        # 執行雙重回測
         dir_acc, win_rate, count, avg_ret = run_historical_validation(df_price, df_news_t, macro_info['Raw'])
         target, _ = calc_4d_target(t, df_price)
         
-        # 當下建議
         can_trade = macro_info['Score'] >= 2
-        status = "🛑 環境紅燈" if not can_trade else "⬜ 觀望"
-        action = "Cash" if not can_trade else "Hold"
         
         results.append({
             'Ticker': t,
-            'Dir_Acc': dir_acc,       # 補回這欄
+            'Dir_Acc': dir_acc,
             'Sniper_Win': win_rate,
             'Sniper_Count': count,
             'Avg_Return': avg_ret,
             'Current': df_price['Close'].iloc[-1],
             'Target': target,
-            'Upside': (target - df_price['Close'].iloc[-1]) / df_price['Close'].iloc[-1]
+            'Upside': (target - df_price['Close'].iloc[-1]) / df_price['Close'].iloc[-1],
+            'Regime': "PASS" if can_trade else "BLOCK"
         })
         
     res_df = pd.DataFrame(results)
     
-    # 顯示優化
     show = res_df.copy()
     show['Dir_Acc'] = show['Dir_Acc'].apply(lambda x: f"{x:.0%}")
     show['Sniper_Win'] = show['Sniper_Win'].apply(lambda x: f"{x:.0%}")
@@ -326,9 +325,10 @@ if run:
     show['Target'] = show['Target'].apply(lambda x: f"${x:.2f}")
     show['Upside'] = show['Upside'].apply(lambda x: f"{x:+.1%}")
 
-    st.dataframe(show)
+    st.dataframe(show[['Ticker', 'Dir_Acc', 'Sniper_Win', 'Sniper_Count', 'Avg_Return', 'Current', 'Target', 'Upside', 'Regime']].style.map(
+        lambda x: 'background-color: #00FF7F; color: black' if 'PASS' in str(x) else 'background-color: #FF4B4B; color: white', subset=['Regime']
+    ))
     
-    # 氣泡圖
     fig = go.Figure()
     for i, row in res_df.iterrows():
         color = '#00FF7F' if row['Sniper_Win'] > 0.6 else '#FF4B4B'
@@ -338,7 +338,7 @@ if run:
             mode='markers+text', text=[row['Ticker']],
             textposition="top center", marker=dict(size=size, color=color),
             name=row['Ticker'],
-            hovertemplate="<b>%{text}</b><br>長期方向準度: %{x:.0%}<br>天眼狙擊勝率: %{y:.0%}"
+            hovertemplate="<b>%{text}</b><br>Dir Acc: %{x:.0%}<br>Win Rate: %{y:.0%}"
         ))
-    fig.update_layout(title="模型效能矩陣 (X=基本功, Y=必殺技)", xaxis_title="方向準確度", yaxis_title="狙擊勝率", template="plotly_dark")
+    fig.update_layout(title="模型效能矩陣", xaxis_title="方向準確度", yaxis_title="狙擊勝率", template="plotly_dark")
     st.plotly_chart(fig, use_container_width=True)
